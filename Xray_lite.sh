@@ -1,0 +1,1519 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- UTF-8 bootstrap ----
+ensure_utf8_locale() {
+  case "${LC_ALL:-${LANG:-}}" in
+    *UTF-8*|*utf8*) return 0 ;;
+  esac
+  if locale -a 2>/dev/null | grep -qi '^C\.UTF-8$'; then
+    export LANG=C.UTF-8; export LC_ALL=C.UTF-8; return 0
+  fi
+  if locale -a 2>/dev/null | grep -qi '^en_US\.utf8$'; then
+    export LANG=en_US.UTF-8; export LC_ALL=en_US.UTF-8; return 0
+  fi
+  if locale -a 2>/dev/null | grep -qi '^zh_CN\.utf8$'; then
+    export LANG=zh_CN.UTF-8; export LC_ALL=zh_CN.UTF-8; return 0
+  fi
+}
+ensure_utf8_locale
+
+# ========== Color ==========
+C_RST="\033[0m"; C_BAD="\033[1;91m"; C_OK="\033[1;32m"; C_WARN="\033[1;33m"; C_INFO="\033[1;36m"; C_SUB="\033[1;35m"; C_DIM="\033[0;90m"
+red(){ printf '\033[1;91m%s\033[0m\n' "$1"; }; green(){ printf '\033[1;32m%s\033[0m\n' "$1"; }; yellow(){ printf '\033[1;33m%s\033[0m\n' "$1"; }; purple(){ printf '\033[1;35m%s\033[0m\n' "$1"; }
+clear_buffer(){ while read -r -t 0.08 -n 10000 _d </dev/tty 2>/dev/null; do :; done; }
+prompt(){ clear_buffer; printf '\033[1;91m%s\033[0m' "$1" >&2; read -r "$2" </dev/tty; }
+pause(){ printf '\n\033[1;91m按回车继续...\033[0m\n' >&2; clear_buffer; read -r _d </dev/tty; }
+cls(){ clear; printf '\033[3J\033[2J\033[H'; }
+url_encode(){ jq -rn --arg x "$1" '$x|@uri'; }
+
+[ "$EUID" -ne 0 ] && red "请用 root 运行" && exit 1
+[ -t 0 ] || { red "请在交互终端运行"; exit 1; }
+
+# ========== Smart Menu Render ==========
+C_NUM="\033[1;36m"; C_TXT="\033[1;36m"
+KW_POOL=("\033[1;32m" "\033[1;35m" "\033[1;33m" "\033[1;91m" "\033[1;92m")
+_LAST_KW_IDX=-1
+
+pick_kw_color(){
+  local idx=$((RANDOM % ${#KW_POOL[@]}))
+  [ "$idx" -eq "$_LAST_KW_IDX" ] && idx=$(((idx+1) % ${#KW_POOL[@]}))
+  _LAST_KW_IDX="$idx"
+  printf '%b' "${KW_POOL[$idx]}"
+}
+
+auto_hl(){
+  local s="$1"; local pre kw c left right
+  case "$s" in 返回|退出) printf "%b%s%b" "$C_BAD" "$s" "$C_RST"; return ;; esac
+  if [[ "$s" == *卸载* ]]; then
+    left="${s%%卸载*}"; right="${s#*卸载}"
+    printf "%b%s%b%b卸载%b%b%s%b" "$C_TXT" "$left" "$C_RST" "$C_BAD" "$C_RST" "$C_TXT" "$right" "$C_RST"
+    return
+  fi
+  for pre in 管理 安装 查看 修改 重启 设置 创建 实时 配置 启用 关闭 删除 添加 定时 彻底; do
+    if [[ "$s" == "$pre"* ]]; then
+      kw="${s#$pre}"
+      if [ -z "$kw" ]; then printf "%b%s%b" "$C_TXT" "$s" "$C_RST"; else
+        c="$(pick_kw_color)"; printf "%b%s%b%b%s%b" "$C_TXT" "$pre" "$C_RST" "$c" "$kw" "$C_RST"; fi
+      return
+    fi
+  done
+  printf "%b%s%b" "$C_TXT" "$s" "$C_RST"
+}
+
+strip_ansi(){ sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g'; }
+vlen(){ printf '%s' "$1" | strip_ansi | awk '{print length}'; }
+term_cols(){ local c; c="$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)"; [ -z "$c" ] && c=80; echo "$c"; }
+
+menu_row2_auto(){
+  local lnum="$1" ltxt="$2" rnum="${3:-}" rtxt="${4:-}"
+  local left right right_col=20
+  left="$(printf "%b%2s.%b %s" "$C_NUM" "$lnum" "$C_RST" "$(auto_hl "$ltxt")")"
+  if [ -z "$rnum" ] || [ -z "$rtxt" ]; then printf "%s\n" "$left"; return; fi
+  right="$(printf "%b%2s.%b %s" "$C_NUM" "$rnum" "$C_RST" "$(auto_hl "$rtxt")")"
+  printf "%s\033[%sG%s\n" "$left" "$right_col" "$right"
+}
+
+menu_item_auto(){
+  local num="$1" txt="$2"
+  printf "%b%2s.%b %s\n" "$C_NUM" "$num" "$C_RST" "$(auto_hl "$txt")"
+}
+
+# ========== Paths ==========
+WORK="/etc/xray"
+XRAY_BIN="${WORK}/xray"
+XRAY_CONF="${WORK}/config.json"
+
+TLS_BASE="/etc/ssgo/tls"
+TLS_DIR_HY2="${TLS_BASE}/hy2"
+
+ARGO_DOMAIN="${WORK}/domain_argo.txt"
+ARGO_YML="${WORK}/tunnel_argo.yml"
+ARGO_JSON="${WORK}/tunnel_argo.json"
+
+RESTART_CONF="${WORK}/restart.conf"
+OUTBOUND_CONF="${WORK}/outbound_policy.conf"
+IPCACHE="${WORK}/ip_cache.conf"
+HY2_STATE="${WORK}/hy2_state.conf"
+
+SWAP_LOG="/tmp/swap.log"
+
+UUID_FALLBACK="$(cat /proc/sys/kernel/random/uuid)"
+CFIP=${CFIP:-'172.67.146.150'}
+SS_FIXED_IP="172.64.147.74"
+
+HY2_SELF_SNI_DEFAULT="www.amd.com"
+
+GHFAST_PREFIX="https://ghfast.top/"
+GH_SPEED_THRESHOLD_MBPS=20
+GH_SPEED_THRESHOLD_BPS=2500000
+GH_USE_FAST_MIRROR=0
+
+SCRIPT_URL_DEFAULT="https://raw.githubusercontent.com/KisThFir/Xray-ssgo/refs/heads/main/Xray_ssgo.sh"
+SCRIPT_URL="${SCRIPT_URL:-$SCRIPT_URL_DEFAULT}"
+
+YOUTUBE_MODE=1
+V6_SITES=""
+
+IP_CHECKED=0; IP_CACHE_MTIME=0; WAN4=""; WAN6=""; COUNTRY4=""; COUNTRY6=""; ISP4=""; ISP6=""; EMOJI4=""; EMOJI6=""; BASE_REGION="Node"; BASE_FULL="Node"
+CPU_LAST_TOTAL=0; CPU_LAST_IDLE=0
+
+# ========== Service ==========
+is_alpine(){ [ -f /etc/alpine-release ]; }
+service_exists(){ local s="$1"; if is_alpine; then [ -f "/etc/init.d/${s}" ]; else [ -f "/etc/systemd/system/${s}.service" ] || systemctl list-unit-files 2>/dev/null | grep -q "^${s}\.service"; fi; }
+svc(){ local act="$1" s="$2"; if is_alpine; then case "$act" in start|stop|restart) rc-service "$s" "$act" >/dev/null 2>&1 || true ;; enable) rc-update add "$s" default >/dev/null 2>&1 || true ;; disable) rc-update del "$s" default >/dev/null 2>&1 || true ;; esac; else case "$act" in enable) systemctl enable "$s" >/dev/null 2>&1 || true; systemctl daemon-reload >/dev/null 2>&1 || true ;; disable) systemctl disable "$s" >/dev/null 2>&1 || true; systemctl daemon-reload >/dev/null 2>&1 || true ;; *) systemctl "$act" "$s" >/dev/null 2>&1 || true ;; esac; fi; }
+is_running(){ if is_alpine; then rc-service "$1" status 2>/dev/null | grep -q started; else [ "$(systemctl is-active "$1" 2>/dev/null)" = "active" ]; fi; }
+
+# ========== Package ==========
+need_cmd(){ command -v "$1" >/dev/null 2>&1; }
+pkg_install(){
+  [ "$#" -eq 0 ] && return 0
+  local mgr=""
+  if command -v apt-get >/dev/null 2>&1; then mgr="apt"; elif command -v dnf >/dev/null 2>&1; then mgr="dnf"; elif command -v yum >/dev/null 2>&1; then mgr="yum"; elif command -v apk >/dev/null 2>&1; then mgr="apk"; else red "未找到可用包管理器"; return 1; fi
+  local pkgs=() p mapped
+  for p in "$@"; do
+    mapped="$p"
+    case "$mgr:$p" in dnf:iproute2|yum:iproute2) mapped="iproute" ;; apk:coreutils) mapped="coreutils" ;; apt:iproute2|apk:iproute2) mapped="iproute2" ;; esac
+    pkgs+=("$mapped")
+  done
+  case "$mgr" in
+    apt) apt-get update -y >/dev/null 2>&1 || true; DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 || true ;;
+    dnf) dnf install -y "${pkgs[@]}" >/dev/null 2>&1 || true ;;
+    yum) yum install -y "${pkgs[@]}" >/dev/null 2>&1 || true ;;
+    apk) apk add --no-cache "${pkgs[@]}" >/dev/null 2>&1 || true ;;
+  esac
+}
+ensure_deps(){
+  need_cmd jq || pkg_install jq
+  need_cmd wget || pkg_install wget
+  need_cmd ip || pkg_install iproute2
+  need_cmd base64 || pkg_install coreutils
+  need_cmd tar || pkg_install tar
+  need_cmd unzip || pkg_install unzip
+  need_cmd openssl || pkg_install openssl
+  need_cmd ss || pkg_install iproute2
+  [ -f /etc/alpine-release ] && pkg_install ca-certificates || true
+  for c in jq wget ip base64 tar unzip openssl; do
+    command -v "$c" >/dev/null 2>&1 || { red "依赖缺失: $c"; return 1; }
+  done
+  return 0
+}
+
+# ========== Helpers ==========
+detect_xray_arch(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo "64" ;; aarch64|arm64) echo "arm64-v8a" ;; i?86) echo "32" ;; armv7l|armv7|armhf) echo "arm32-v7a" ;; armv6l|armv6) echo "arm32-v6" ;; s390x) echo "s390x" ;; riscv64) echo "riscv64" ;; *) echo "" ;;
+  esac
+}
+detect_cloudflared_arch(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;; aarch64|arm64) echo "arm64" ;; i?86) echo "386" ;; armv7l|armv7|armhf) echo "arm" ;; *) echo "" ;;
+  esac
+}
+normalize_path(){ [ -z "${1:-}" ] && echo "/" || { case "$1" in /*) echo "$1" ;; *) echo "/$1" ;; esac; }; }
+gen_uuid(){ cat /proc/sys/kernel/random/uuid; }
+is_github_url(){
+  case "$1" in https://github.com/*|https://raw.githubusercontent.com/*) return 0 ;; *) return 1 ;; esac
+}
+ghfast_url(){ local u="$1"; echo "${GHFAST_PREFIX}${u}"; }
+smart_download(){
+  local out="$1" url="$2" min="$3"
+  local t=0 u="" is_gh=0 elapsed sz speed
+  is_github_url "$url" && is_gh=1 || is_gh=0
+  while [ "$t" -lt 3 ]; do
+    rm -f "$out"
+    if [ "$is_gh" -eq 1 ] && [ "${GH_USE_FAST_MIRROR:-0}" -eq 1 ]; then
+      u="$(ghfast_url "$url")"
+    else
+      u="$url"
+    fi
+    local ts_start ts_end
+    ts_start="$(date +%s)"
+    if command -v curl >/dev/null 2>&1; then curl -L --connect-timeout 10 --max-time 180 -o "$out" "$u" >/dev/null 2>&1 || true; fi
+    if [ ! -s "$out" ] && command -v wget >/dev/null 2>&1; then
+      if wget --help 2>&1 | grep -q -- '--show-progress'; then wget -q --show-progress --timeout=40 --tries=1 -O "$out" "$u" || true; else wget -q -T 40 -O "$out" "$u" || true; fi
+    fi
+    ts_end="$(date +%s)"; elapsed=$((ts_end - ts_start)); [ "$elapsed" -le 0 ] && elapsed=1
+    if [ -f "$out" ]; then
+      sz="$(wc -c < "$out" 2>/dev/null || echo 0)"; speed=$((sz / elapsed))
+      if [ "${sz:-0}" -ge "$min" ]; then
+        if [ "$is_gh" -eq 1 ] && [ "${GH_USE_FAST_MIRROR:-0}" -eq 0 ] && [ "$u" = "$url" ]; then
+          if [ "$speed" -lt "${GH_SPEED_THRESHOLD_BPS:-2500000}" ]; then
+            yellow "GitHub主站速度低于${GH_SPEED_THRESHOLD_MBPS}Mbps，切换并锁定 ghfast 备用源"
+            GH_USE_FAST_MIRROR=1; rm -f "$out"; t=$((t+1)); sleep 1; continue
+          fi
+        fi
+        return 0
+      fi
+    fi
+    if [ "$is_gh" -eq 1 ] && [ "${GH_USE_FAST_MIRROR:-0}" -eq 0 ] && [ "$u" = "$url" ]; then
+      yellow "GitHub主站下载失败，切换并锁定 ghfast 备用源"
+      GH_USE_FAST_MIRROR=1
+    fi
+    rm -f "$out"; t=$((t+1)); sleep 2
+  done
+  return 1
+}
+update_xray(){
+  if ! jq "$@" "$XRAY_CONF" > "${XRAY_CONF}.tmp"; then rm -f "${XRAY_CONF}.tmp"; red "配置更新失败"; return 1; fi
+  mv "${XRAY_CONF}.tmp" "$XRAY_CONF"
+}
+
+# ========== State ==========
+load_state(){
+  if [ -f "$RESTART_CONF" ]; then
+    RESTART_HOURS="$(cat "$RESTART_CONF" 2>/dev/null || echo 0)"
+    [[ "$RESTART_HOURS" =~ ^[0-9]+$ ]] || RESTART_HOURS=0
+  fi
+  if [ -f "$OUTBOUND_CONF" ]; then
+    YOUTUBE_MODE="$(awk -F= '/^YOUTUBE_MODE=/{print $2}' "$OUTBOUND_CONF" 2>/dev/null)"
+    [[ "$YOUTUBE_MODE" =~ ^[12]$ ]] || YOUTUBE_MODE=1
+    V6_SITES="$(awk -F= '/^V6_SITES=/{print $2}' "$OUTBOUND_CONF" 2>/dev/null)"
+  fi
+}
+save_outbound(){
+  mkdir -p "$WORK"
+  cat > "$OUTBOUND_CONF" <<EOF
+YOUTUBE_MODE=${YOUTUBE_MODE}
+V6_SITES=${V6_SITES}
+EOF
+}
+
+# ========== IP / ISP ==========
+country_flag(){
+  local cc="${1^^}"; [[ "$cc" =~ ^[A-Z]{2}$ ]] || { echo ""; return; }
+  case "${LC_ALL:-${LANG:-}}" in *UTF-8*|*utf8*) ;; *) echo ""; return ;; esac
+  local o1 o2 cp1 cp2
+  o1=$(printf '%d' "'${cc:0:1}"); o2=$(printf '%d' "'${cc:1:1}")
+  cp1=$((0x1F1E6 + o1 - 65)); cp2=$((0x1F1E6 + o2 - 65))
+  eval "printf '%s' \$'\\U$(printf '%08X' "$cp1")\\U$(printf '%08X' "$cp2")'"
+}
+clean_isp(){
+  local s="$1"
+  s="$(echo "$s" | sed -E 's/^AS(AS)?[0-9]+[[:space:]]+//I')"; s="${s#AS[0-9]* }"
+  s="$(echo "$s" | sed -E 's/[[:space:],]+$//; s/^[[:space:],]+//')"
+  s="$(echo "$s" | sed -E 's/[[:space:]]+(LLC|Inc\.?|Ltd\.?|Corp\.?|Limited|Company|GmbH|SAS|PLC|Co\.?)$//I')"
+  s="$(echo "$s" | sed -E 's/[[:space:],]+$//; s/^[[:space:],]+//')"
+  echo "$s"
+}
+save_ip_cache(){
+  mkdir -p "$WORK"
+  cat > "$IPCACHE" <<EOF
+WAN4=$(printf '%q' "$WAN4")
+WAN6=$(printf '%q' "$WAN6")
+COUNTRY4=$(printf '%q' "$COUNTRY4")
+COUNTRY6=$(printf '%q' "$COUNTRY6")
+ISP4=$(printf '%q' "$ISP4")
+ISP6=$(printf '%q' "$ISP6")
+EMOJI4=$(printf '%q' "$EMOJI4")
+EMOJI6=$(printf '%q' "$EMOJI6")
+BASE_REGION=$(printf '%q' "$BASE_REGION")
+BASE_FULL=$(printf '%q' "$BASE_FULL")
+EOF
+}
+load_ip_cache(){
+  [ -f "$IPCACHE" ] || return 1
+  . "$IPCACHE" 2>/dev/null || return 1
+  [ -n "${WAN4}${WAN6}" ] || return 1
+  IP_CHECKED=1
+  return 0
+}
+apply_base_name(){
+  local cc isp emo short_isp
+  if [ -n "$COUNTRY4" ] || [ -n "$ISP4" ]; then cc="${COUNTRY4^^}"; isp="$ISP4"; emo="$EMOJI4"; else cc="${COUNTRY6^^}"; isp="$ISP6"; emo="$EMOJI6"; fi
+  [ -z "$emo" ] && emo="$(country_flag "$cc" 2>/dev/null || true)"
+  if [ -n "$isp" ]; then
+    short_isp=$(echo "$isp" | awk '{print toupper(substr($1,1,1)) tolower(substr($1,2))}')
+    BASE_FULL="${emo} ${cc} ${short_isp}"
+  else
+    BASE_FULL="${emo} ${cc}"
+  fi
+  [ -z "$BASE_FULL" ] && BASE_FULL="Node"
+}
+fill_by_ipinfo_ip(){
+  local fam="$1" ip="$2"
+  [ -z "$ip" ] && return 1
+  local j cc org
+  j="$(curl -sf --max-time 6 "https://ipinfo.io/${ip}/json" 2>/dev/null || true)"
+  if [ -z "$j" ] || ! echo "$j" | jq -e '.ip' >/dev/null 2>&1; then
+    org="$(curl -sf --max-time 5 "https://ipinfo.io/${ip}/org" 2>/dev/null || true)"
+    cc="$(curl -sf --max-time 5 "https://ipinfo.io/${ip}/country" 2>/dev/null || true)"
+    if [ "$fam" = "4" ]; then
+      WAN4="$ip"; COUNTRY4="$cc"; EMOJI4="$(country_flag "$cc" 2>/dev/null || true)"; ISP4="$(clean_isp "$org")"; [ -z "$ISP4" ] && ISP4="unknown"
+    else
+      WAN6="$ip"; COUNTRY6="$cc"; EMOJI6="$(country_flag "$cc" 2>/dev/null || true)"; ISP6="$(clean_isp "$org")"; [ -z "$ISP6" ] && ISP6="unknown"
+    fi
+    return 0
+  fi
+  cc="$(echo "$j" | jq -r '.country // empty' 2>/dev/null || true)"
+  org="$(echo "$j" | jq -r '.org // empty' 2>/dev/null || true)"
+  if [ "$fam" = "4" ]; then
+    WAN4="$(echo "$j" | jq -r '.ip // empty' 2>/dev/null || true)"; COUNTRY4="$cc"; EMOJI4="$(country_flag "$cc" 2>/dev/null || true)"; ISP4="$(clean_isp "$org")"; [ -z "$ISP4" ] && ISP4="unknown"
+  else
+    WAN6="$(echo "$j" | jq -r '.ip // empty' 2>/dev/null || true)"; COUNTRY6="$cc"; EMOJI6="$(country_flag "$cc" 2>/dev/null || true)"; ISP6="$(clean_isp "$org")"; [ -z "$ISP6" ] && ISP6="unknown"
+  fi
+}
+get_local_ipv6_fallback(){
+  local ip6=""
+  ip6="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+  [ -z "$ip6" ] && ip6="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | cut -d/ -f1 | grep -v '^fe80:' | head -n1 || true)"
+  echo "$ip6"
+}
+check_ip(){
+  [ "${IP_CHECKED:-0}" = "1" ] && return 0
+  WAN4=""; WAN6=""; COUNTRY4=""; COUNTRY6=""; ISP4=""; ISP6=""; EMOJI4=""; EMOJI6=""
+  local ip4 ip6
+  ip4="$(curl -4 -sf --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  [ -n "$ip4" ] && fill_by_ipinfo_ip 4 "$ip4" || true
+  ip6="$(curl -6 -sf --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
+  if [ -n "$ip6" ]; then
+    WAN6="$ip6"; fill_by_ipinfo_ip 6 "$WAN6" || true
+  else
+    ip6="$(get_local_ipv6_fallback || true)"
+    [ -n "$ip6" ] && { WAN6="$ip6"; fill_by_ipinfo_ip 6 "$WAN6" || true; }
+  fi
+  apply_base_name || true
+  IP_CHECKED=1; save_ip_cache || true
+  return 0
+}
+pick_node_host(){
+  if [ -n "${WAN6:-}" ]; then echo "[${WAN6}]"; elif [ -n "${WAN4:-}" ]; echo "${WAN4}"; else echo ""; fi
+}
+
+# ========== Domain helpers ==========
+normalize_domain_item(){ local s="$1"; s="${s#http://}"; s="${s#https://}"; s="${s%%/*}"; s="${s%%:*}"; s="$(echo "$s" | tr '[:upper:]' '[:lower:]' | sed 's/^ *//;s/ *$//;s/^\.*//')"; echo "$s"; }
+merge_csv(){ local a="$1" b="$2"; if [ -z "$a" ]; then echo "$b"; return; fi; if [ -z "$b" ]; then echo "$a"; return; fi; echo "${a},${b}"; }
+csv_to_json_unique(){
+  local d="$1"; local raw_arr=() clean_arr=() item
+  IFS=',' read -r -a raw_arr <<< "$d"
+  for item in "${raw_arr[@]}"; do
+    item="$(normalize_domain_item "$item")"; [ -z "$item" ] && continue; clean_arr+=("$item")
+  done
+  printf '%s\n' "${clean_arr[@]}" | awk 'NF' | sort -u | jq -Rsc 'split("\n")|map(select(length>0))'
+}
+build_v6_domains_json(){ csv_to_json_unique "$V6_SITES"; }
+yt_mode_str(){ case "$YOUTUBE_MODE" in 2) echo "开启(严格)" ;; *) echo "关闭" ;; esac; }
+
+# ========== Xray core ==========
+init_xray_conf(){
+  mkdir -p "$WORK"
+  [ -f "$XRAY_CONF" ] && return
+  cat > "$XRAY_CONF" <<'EOF'
+{
+  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
+  "dns": {
+    "servers": [
+      { "address": "https+local://1.1.1.1/dns-query", "queryStrategy": "UseIPv4" },
+      { "address": "https+local://8.8.8.8/dns-query", "queryStrategy": "UseIPv4" }
+    ],
+    "queryStrategy": "UseIPv4",
+    "enableParallelQuery": true,
+    "disableFallback": true,
+    "serveStale": true,
+    "serveExpiredTTL": 0
+  },
+  "inbounds": [],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct", "settings": { "domainStrategy": "UseIPv4" } },
+    { "protocol": "dns", "tag": "dns-out" }
+  ],
+  "routing": {
+    "rules": [
+      { "type": "field", "port": "53", "outboundTag": "dns-out" },
+      { "type": "field", "protocol": "dns", "outboundTag": "dns-out" }
+    ]
+  }
+}
+EOF
+}
+ensure_dns_rule(){
+  init_xray_conf
+  local has_dnsout
+  has_dnsout=$(jq '[.outbounds[]?.tag] | contains(["dns-out"])' "$XRAY_CONF" 2>/dev/null || echo false)
+  [ "$has_dnsout" = "true" ] || update_xray '.outbounds += [{"protocol":"dns","tag":"dns-out"}]'
+  jq -e '.routing' "$XRAY_CONF" >/dev/null 2>&1 || update_xray '.routing={"rules":[]}'
+  update_xray 'del(.routing.rules[]? | select(.port=="53" or .protocol=="dns"))'
+  update_xray '.routing.rules += [{"type":"field","port":"53","outboundTag":"dns-out"},{"type":"field","protocol":"dns","outboundTag":"dns-out"}]'
+}
+ensure_geosite(){
+  [ -s "${WORK}/geosite.dat" ] && return 0
+  yellow "未检测到 geosite.dat，尝试下载..."
+  if smart_download "${WORK}/geosite.dat" \
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" 1000000; then
+    green "geosite.dat 已就绪"; return 0
+  fi
+  red "geosite.dat 下载失败"; return 1
+}
+xray_uuid(){
+  if [ -f "$XRAY_CONF" ]; then
+    local u; u=$(jq -r '(first(.inbounds[]? | select(.protocol=="vless") | .settings.clients[0].id) // empty)' "$XRAY_CONF" 2>/dev/null || true)
+    [ -n "$u" ] && { echo "$u"; return; }
+  fi
+  echo "$UUID_FALLBACK"
+}
+set_xray_uuid(){
+  local u="$1"; [ -f "$XRAY_CONF" ] || { red "xray未安装"; return 1; }
+  update_xray --arg uuid "$u" '(.inbounds[]? | select(.protocol=="vless") | .settings.clients[0].id) |= $uuid'
+  svc restart xray; green "UUID已更新: $u"
+}
+install_xray(){
+  ensure_deps || return 1; mkdir -p "$WORK"; init_xray_conf; ensure_dns_rule
+  if [ ! -x "$XRAY_BIN" ]; then
+    local arch url
+    arch="$(detect_xray_arch)"; [ -z "$arch" ] && { red "架构不支持Xray"; return 1; }
+    url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip"
+    smart_download "${WORK}/xray.zip" "$url" 5000000 || { red "下载Xray失败"; return 1; }
+    unzip -o "${WORK}/xray.zip" -d "${WORK}/" >/dev/null 2>&1 || return 1
+    chmod +x "$XRAY_BIN"; rm -f "${WORK}/xray.zip" "${WORK}/README.md" "${WORK}/LICENSE"
+  fi
+  if ! service_exists xray; then
+    if is_alpine; then
+      cat > /etc/init.d/xray <<EOF
+#!/sbin/openrc-run
+description="Xray Service"
+command="${XRAY_BIN}"
+command_args="run -c ${XRAY_CONF}"
+command_background=true
+pidfile="/var/run/xray.pid"
+EOF
+      chmod +x /etc/init.d/xray
+    else
+      cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+After=network.target
+[Service]
+ExecStart=${XRAY_BIN} run -c ${XRAY_CONF}
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+    svc enable xray
+  fi
+  svc restart xray; green "Xray 安装完成"
+}
+
+# ========== Outbound apply (Revised) ==========
+apply_policy_xray(){
+  [ -f "$XRAY_CONF" ] || return 0; ensure_dns_rule
+  update_xray '
+    .outbounds = (
+      [
+        {"protocol":"freedom","tag":"direct-v4","settings":{"domainStrategy":"UseIPv4"}},
+        {"protocol":"freedom","tag":"direct-v6","settings":{"domainStrategy":"UseIPv6"}},
+        {"protocol":"blackhole","tag":"block-v4"}
+      ]
+      + (
+          [ .outbounds[]? | select(.tag=="dns-out") ]
+          | if length>0 then . else [{"protocol":"dns","tag":"dns-out"}] end
+        )
+      + [ .outbounds[]? | select(.tag!="direct" and .tag!="direct-v4" and .tag!="direct-v6" and .tag!="block-v4" and .tag!="dns-out") ]
+    )'
+  update_xray 'del(.routing.rules[]? | select(
+    .tag=="v6-strict-rule" or
+    .tag=="v6-geosite-strict-route-rule" or
+    .tag=="v6-geosite-strict-reject-rule"
+  ))'
+  local v6_domains
+  v6_domains="$(build_v6_domains_json)"
+  if [ "$(echo "$v6_domains" | jq 'length')" -gt 0 ]; then
+    update_xray --argjson d "$v6_domains" '.routing.rules += [{"type":"field","domain":($d|map("domain:"+.)),"outboundTag":"direct-v6","tag":"v6-strict-rule"}]'
+  fi
+  if [ "$YOUTUBE_MODE" = "2" ]; then
+    if ensure_geosite; then
+      update_xray '.routing.rules += [{"type":"field","domain":["geosite:youtube"],"ip":["0.0.0.0/0"],"outboundTag":"block-v4","tag":"v6-geosite-strict-reject-rule"}]'
+      update_xray '.routing.rules += [{"type":"field","domain":["geosite:youtube"],"outboundTag":"direct-v6","tag":"v6-geosite-strict-route-rule"}]'
+    else
+      red "geosite 不可用，YouTube 严格规则未应用"
+    fi
+  fi
+}
+apply_policy_all(){
+  apply_policy_xray || true
+  if [ -x "$XRAY_BIN" ] && [ -f "$XRAY_CONF" ]; then
+    if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_check_apply.log 2>&1; then
+      red "Xray 配置校验失败，已跳过重启"
+      tail -n 50 /tmp/xray_check_apply.log 2>/dev/null || true
+    else
+      service_exists xray && svc restart xray
+    fi
+  fi
+  green "出站规则已应用（Xray）"
+}
+ask_enable_youtube_strict(){
+  local yn
+  prompt "是否开启 YouTube 严格V6出站? (1=关闭 2=开启(严格)，默认1): " yn
+  case "$yn" in 2) YOUTUBE_MODE=2 ;; *) YOUTUBE_MODE=1 ;; esac
+  save_outbound; apply_policy_all || true
+}
+
+# ========== Argo ==========
+install_cloudflared(){
+  mkdir -p "$WORK"
+  local arch url tmp bin
+  bin="${WORK}/argo"
+  arch="$(detect_cloudflared_arch)"; [ -z "$arch" ] && { red "架构不支持 cloudflared"; return 1; }
+  case "$arch" in
+    amd64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+    arm64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+    386)   url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386" ;;
+    arm)   url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm" ;;
+    *) red "未知架构: $arch"; return 1 ;;
+  esac
+  if [ -x "$bin" ] && "$bin" --version >/dev/null 2>&1; then green "cloudflared 已存在，跳过下载"; return 0; fi
+  tmp="${WORK}/argo.tmp"
+  smart_download "$tmp" "$url" 10000000 || { red "下载 cloudflared 失败"; rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$bin"; chmod +x "$bin"
+  "$bin" --version >/dev/null 2>&1 || { red "cloudflared 校验失败"; rm -f "$bin"; return 1; }
+  green "cloudflared 安装完成"
+}
+install_argo(){
+  install_xray || return 1; ensure_dns_rule || return 1; install_cloudflared || return 1
+  local domain auth ss_pass mc ss_method tunnel_id uuid
+  prompt "Argo域名: " domain; [ -z "$domain" ] && { red "不能为空"; return 1; }
+  prompt "Argo JSON凭证: " auth; echo "$auth" | grep -q "TunnelSecret" || { red "必须是JSON凭证"; return 1; }
+  prompt "SS密码(回车随机UUID): " ss_pass; [ -z "$ss_pass" ] && ss_pass="$(gen_uuid)"
+  prompt "SS加密(1=aes-128-gcm 2=aes-256-gcm，默认1): " mc; [ -z "$mc" ] && mc=1; ss_method="aes-128-gcm"; [ "$mc" = "2" ] && ss_method="aes-256-gcm"
+  echo "$domain" > "$ARGO_DOMAIN"
+  tunnel_id="$(echo "$auth" | jq -r '.TunnelID' 2>/dev/null || true)"
+  [ -z "$tunnel_id" ] && tunnel_id="$(echo "$auth" | cut -d'"' -f12)"
+  echo "$auth" > "$ARGO_JSON"
+  cat > "$ARGO_YML" <<EOF
+tunnel: ${tunnel_id}
+credentials-file: ${ARGO_JSON}
+protocol: http2
+ingress:
+  - hostname: ${domain}
+    path: /argo
+    service: http://localhost:8080
+    originRequest: { noTLSVerify: true }
+  - hostname: ${domain}
+    path: /xgo
+    service: http://localhost:8081
+    originRequest: { noTLSVerify: true }
+  - hostname: ${domain}
+    path: /ssgo
+    service: http://localhost:8082
+    originRequest: { noTLSVerify: true }
+  - service: http_status:404
+EOF
+  uuid="$(xray_uuid)"
+  update_xray 'del(.inbounds[]? | select(.port==8080 or .port==8081 or .port==8082))'
+  local ws xh ss
+  ws='{"port":8080,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  xh=$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" \
+      '{"port":8081,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')
+  ss='{"port":8082,"listen":"127.0.0.1","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  update_xray --argjson ws "$ws" --argjson xh "$xh" --argjson ss "$ss" '.inbounds += [$ws,$xh,$ss]'
+  [ -x "${WORK}/argo" ] || { red "cloudflared 不存在: ${WORK}/argo"; return 1; }
+  local cmd svcname="tunnel-argo"
+  cmd="${WORK}/argo tunnel --edge-ip-version auto --no-autoupdate --config ${ARGO_YML} run"
+  if ! service_exists "$svcname"; then
+    if is_alpine; then
+      cat > "${WORK}/argo_start.sh" <<EOF
+#!/bin/sh
+exec ${cmd}
+EOF
+      chmod +x "${WORK}/argo_start.sh"
+      cat > /etc/init.d/${svcname} <<EOF
+#!/sbin/openrc-run
+description="Cloudflare Tunnel"
+command="${WORK}/argo_start.sh"
+command_background=true
+pidfile="/var/run/${svcname}.pid"
+EOF
+      chmod +x /etc/init.d/${svcname}
+    else
+      cat > /etc/systemd/system/${svcname}.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target
+[Service]
+ExecStart=${cmd}
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+    svc enable "$svcname"
+  fi
+  svc restart xray; svc restart "$svcname"
+  ask_enable_youtube_strict
+  green "Argo 配置完成"
+}
+uninstall_argo(){
+  svc stop tunnel-argo; svc disable tunnel-argo
+  rm -f /etc/init.d/tunnel-argo /etc/systemd/system/tunnel-argo.service "${WORK}/argo_start.sh" "${WORK}/argo"
+  rm -f "$ARGO_DOMAIN" "$ARGO_YML" "$ARGO_JSON"
+  if [ -f "$XRAY_CONF" ]; then
+    update_xray 'del(.inbounds[]? | select(.port==8080 or .port==8081 or .port==8082))'
+    svc restart xray
+  fi
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+  green "Argo 已卸载"
+}
+
+# ========== HY2 ==========
+write_hy2_state(){
+  local port="$1" domain="$2" pass="$3" up="$4" down="$5" obfs="$6" cert_mode="$7"
+  mkdir -p "$WORK"
+  cat > "$HY2_STATE" <<EOF
+PORT=$port
+DOMAIN=$domain
+PASS=$pass
+UP=$up
+DOWN=$down
+OBFS=$obfs
+CERT_MODE=$cert_mode
+EOF
+}
+issue_cert_cf(){
+  local d="$1" token="$2" cert_dir="${3:-$TLS_DIR_HY2}"
+  local crt="${cert_dir}/${d}.crt" key="${cert_dir}/${d}.key"
+  mkdir -p "$cert_dir"
+  if [ -s "$crt" ] && [ -s "$key" ]; then
+    if openssl x509 -in "$crt" -noout -checkend $((30*24*3600)) >/dev/null 2>&1; then
+      green "证书已存在且有效(>30天): $d"; return 0
+    else
+      yellow "证书即将过期或已过期，开始续签: $d"
+    fi
+  fi
+  ensure_acme || return 1
+  export CF_Token="$token"
+  yellow "申请证书: $d"
+  "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+  "$HOME/.acme.sh/acme.sh" --issue -d "$d" --dns dns_cf -k ec-256 >/tmp/acme_issue.log 2>&1 || { red "签发失败"; tail -n 80 /tmp/acme_issue.log 2>/dev/null || true; return 1; }
+  "$HOME/.acme.sh/acme.sh" --installcert -d "$d" --fullchainpath "$crt" --keypath "$key" --ecc >/tmp/acme_installcert.log 2>&1 || true
+  [ -s "$crt" ] && [ -s "$key" ] || { red "安装证书失败"; tail -n 80 /tmp/acme_installcert.log 2>/dev/null || true; return 1; }
+  green "证书安装成功"
+}
+issue_cert_selfsigned(){
+  local d="$1" cert_dir="${2:-$TLS_DIR_HY2}"
+  local crt="${cert_dir}/${d}.crt" key="${cert_dir}/${d}.key"
+  mkdir -p "$cert_dir"
+  if [ -s "$crt" ] && [ -s "$key" ]; then
+    if openssl x509 -in "$crt" -noout -checkend $((30*24*3600)) >/dev/null 2>&1; then
+      green "自签证书已存在且有效(>30天): $d"; return 0
+    else
+      yellow "自签证书即将过期或已过期，重新生成: $d"
+    fi
+  fi
+  
+  openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3650 \
+    -subj "/CN=${d}" \
+    -keyout "$key" -out "$crt" >/tmp/selfsign_issue.log 2>&1 || {
+    red "自签证书生成失败"
+    tail -n 80 /tmp/selfsign_issue.log 2>/dev/null || true
+    return 1
+  }
+  [ -s "$crt" ] && [ -s "$key" ] || { red "自签证书文件异常"; return 1; }
+  green "自签证书生成成功: $d"
+}
+install_hy2(){
+  install_xray || return 1; ensure_dns_rule || return 1
+  local mode cert_mode domain token port auth obfs prof up down cert_file key_file cert_mode_saved
+  prompt "HY2模式(1=一键最简 2=自定义，默认1): " mode
+  [ -z "${mode:-}" ] && mode=1; [[ "$mode" =~ ^[12]$ ]] || mode=1
+  prompt "证书模式(1=本机自签 2=CF令牌签发，默认1): " cert_mode
+  [ -z "${cert_mode:-}" ] && cert_mode=1; [[ "$cert_mode" =~ ^[12]$ ]] || cert_mode=1
+  if [ "$cert_mode" = "1" ]; then
+    prompt "HY2伪装域名(回车默认 ${HY2_SELF_SNI_DEFAULT}): " domain
+    [ -z "$domain" ] && domain="$HY2_SELF_SNI_DEFAULT"
+    issue_cert_selfsigned "$domain" "$TLS_DIR_HY2" || return 1
+    cert_mode_saved="self"
+  else
+    prompt "HY2域名: " domain; [ -z "$domain" ] && { red "域名不能为空"; return 1; }
+    prompt "Cloudflare API Token: " token; [ -z "$token" ] && { red "Token不能为空"; return 1; }
+    issue_cert_cf "$domain" "$token" "$TLS_DIR_HY2" || return 1
+    cert_mode_saved="cf"
+  fi
+  cert_file="${TLS_DIR_HY2}/${domain}.crt"; key_file="${TLS_DIR_HY2}/${domain}.key"
+  prompt "HY2端口(默认38167): " port; [ -z "$port" ] && port=38167; [[ "$port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+  prompt "HY2认证AUTH(回车随机UUID): " auth; [ -z "$auth" ] && auth="$(gen_uuid)"
+  obfs=""; up=50; down=250
+  if [ "$mode" = "2" ]; then
+    prompt "HY2混淆密码OBFS(回车随机UUID): " obfs; [ -z "$obfs" ] && obfs="$(gen_uuid)"
+    echo "带宽档位: 1.默认(50/250 Mbps) 2.自定义"
+    prompt "选择(默认1): " prof
+    case "$prof" in
+      2) prompt "上行Mbps(默认50): " up; prompt "下行Mbps(默认250): " down; [ -z "$up" ] && up=50; [ -z "$down" ] && down=250; [[ "$up" =~ ^[0-9]+$ ]] || up=50; [[ "$down" =~ ^[0-9]+$ ]] || down=250 ;;
+      *) up=50; down=250 ;;
+    esac
+  else
+    yellow "一键最简模式：无混淆、默认50/250 Mbps（客户端可改）"
+  fi
+  open_port "$port" udp
+  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or ((.tag // "")|startswith("hy2-in-hop-")) or .protocol=="hysteria" or .protocol=="hysteria2"))'
+  local hy2
+  if [ -n "$obfs" ]; then
+    hy2="$(jq -nc \
+      --argjson p "$port" \
+      --arg auth "$auth" \
+      --arg obfs "$obfs" \
+      --arg domain "$domain" \
+      --arg crt "$cert_file" \
+      --arg key "$key_file" \
+'{
+  "tag":"hy2-in",
+  "listen":"::",
+  "port":$p,
+  "protocol":"hysteria",
+  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
+  "streamSettings":{
+    "network":"hysteria",
+    "security":"tls",
+    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
+    "hysteriaSettings":{"version":2},
+    "finalmask":{
+      "udp":[{"type":"salamander","settings":{"password":$obfs}}],
+      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
+    }
+  },
+  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+}')"
+  else
+    hy2="$(jq -nc \
+      --argjson p "$port" \
+      --arg auth "$auth" \
+      --arg domain "$domain" \
+      --arg crt "$cert_file" \
+      --arg key "$key_file" \
+'{
+  "tag":"hy2-in",
+  "listen":"::",
+  "port":$p,
+  "protocol":"hysteria",
+  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
+  "streamSettings":{
+    "network":"hysteria",
+    "security":"tls",
+    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
+    "hysteriaSettings":{"version":2},
+    "finalmask":{
+      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
+    }
+  },
+  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+}')"
+  fi
+  update_xray --argjson ib "$hy2" '.inbounds += [$ib]'
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_hy2_check.log 2>&1; then
+    red "Xray 配置校验失败"; tail -n 80 /tmp/xray_hy2_check.log 2>/dev/null || true; return 1
+  fi
+  svc restart xray
+  write_hy2_state "$port" "$domain" "$auth" "$up" "$down" "$obfs" "$cert_mode_saved"
+  ask_enable_youtube_strict
+  green "HY2 安装成功（Xray）"
+  if [ "$cert_mode_saved" = "self" ]; then green "证书模式：本机自签（客户端默认 insecure=1）"; else green "证书模式：CF令牌签发（客户端默认 insecure=0）"; fi
+  if [ "$mode" = "1" ]; then green "当前为一键最简：无混淆 / 默认50/250 Mbps"; else green "当前为自定义：UP=${up}Mbps DOWN=${down}Mbps"; fi
+}
+reinstall_hy2(){
+  if ! [ -f "$HY2_STATE" ]; then red "HY2 未安装，无需重装"; return; fi
+  local old_port; old_port="$(awk -F= '/^PORT=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
+  svc stop xray || true
+  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or .protocol=="hysteria" or .protocol=="hysteria2"))'
+  local new_port
+  while true; do
+    new_port=$(( RANDOM % 65535 + 1 ))
+    [[ "$new_port" -lt 1024 ]] && continue
+    [[ "$new_port" -eq "$old_port" ]] && continue
+    if ! ss -tuln | grep -q ":${new_port} "; then
+      break
+    fi
+  done
+  green "HY2旧端口: ${old_port}, 新端口: ${new_port}"
+  install_xray || return 1
+  ensure_dns_rule || return 1
+  local mode=1 cert_mode=1 domain auth port obfs up down cert_file key_file cert_mode_saved
+  prompt "证书模式(1=本机自签 2=CF令牌签发，默认1): " cert_mode
+  [ -z "${cert_mode:-}" ] && cert_mode=1; [[ "$cert_mode" =~ ^[12]$ ]] || cert_mode=1
+  if [ "$cert_mode" = "1" ]; then
+    prompt "HY2伪装域名(回车默认 ${HY2_SELF_SNI_DEFAULT}): " domain
+    [ -z "$domain" ] && domain="$HY2_SELF_SNI_DEFAULT"
+    issue_cert_selfsigned "$domain" "$TLS_DIR_HY2" || return 1
+    cert_mode_saved="self"
+  else
+    prompt "HY2域名: " domain; [ -z "$domain" ] && { red "域名不能为空"; return 1; }
+    prompt "Cloudflare API Token: " token; [ -z "$token" ] && { red "Token不能为空"; return 1; }
+    issue_cert_cf "$domain" "$token" "$TLS_DIR_HY2" || return 1
+    cert_mode_saved="cf"
+  fi
+  cert_file="${TLS_DIR_HY2}/${domain}.crt"; key_file="${TLS_DIR_HY2}/${domain}.key"
+  port="$new_port"; auth="$(gen_uuid)"; obfs=""; up=50; down=250
+  open_port "$port" udp
+  local hy2
+  hy2="$(jq -nc \
+    --argjson p "$port" \
+    --arg auth "$auth" \
+    --arg domain "$domain" \
+    --arg crt "$cert_file" \
+    --arg key "$key_file" \
+'{
+  "tag":"hy2-in",
+  "listen":"::",
+  "port":$p,
+  "protocol":"hysteria",
+  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
+  "streamSettings":{
+    "network":"hysteria",
+    "security":"tls",
+    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
+    "hysteriaSettings":{"version":2},
+    "finalmask":{
+      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
+    }
+  },
+  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+}')"
+  update_xray --argjson ib "$hy2" '.inbounds += [$ib]'
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_hy2_reinstall_check.log 2>&1; then
+    red "Xray 配置校验失败"; tail -n 80 /tmp/xray_hy2_reinstall_check.log 2>/dev/null || true; return 1
+  fi
+  svc restart xray
+  write_hy2_state "$port" "$domain" "$auth" "$up" "$down" "$obfs" "$cert_mode_saved"
+  ask_enable_youtube_strict
+  green "HY2 重装成功（新端口: ${port}）"
+}
+uninstall_hy2(){
+  [ -f "$XRAY_CONF" ] || { red "xray未安装"; return 1; }
+  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or (.tag|startswith("hy2-in-hop-")) or .protocol=="hysteria" or .protocol=="hysteria2"))'
+  rm -f "$HY2_STATE"
+  svc restart xray; green "HY2 已卸载"
+}
+
+# ========== Nodes ==========
+show_xray_nodes(){
+  cls
+  [ "$IP_CHECKED" = "1" ] || load_ip_cache >/dev/null 2>&1 || true
+  [ "$IP_CHECKED" = "1" ] || check_ip || true
+  [ -f "$XRAY_CONF" ] || { red "xray未安装"; return; }
+  local ip="" uuid cnt=0
+  ip="$(pick_node_host)"; uuid="$(xray_uuid)"; [ -z "$BASE_FULL" ] && BASE_FULL="Node"
+  green "=============== 节点链接 ================"
+  if [ -f "$ARGO_DOMAIN" ]; then
+    local d xextra nx nw ns
+    d="$(cat "$ARGO_DOMAIN")"
+    xextra="$(url_encode "$XHTTP_EXTRA_JSON")"
+    nx="${BASE_FULL} - ArgoXHTTP"; nw="${BASE_FULL} - ArgoWS"; ns="${BASE_FULL} - ArgoSS"
+    purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&alpn=h2&fp=chrome&type=xhttp&host=${d}&path=%2Fxgo&mode=${XHTTP_MODE}&extra=${xextra}#$(url_encode "$nx")"; echo
+    purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&fp=chrome&type=ws&host=${d}&path=%2Fargo%3Fed%3D2560#$(url_encode "$nw")"; echo
+    cnt=$((cnt+2))
+    local ssib
+    ssib="$(jq -c '.inbounds[]? | select(.protocol=="shadowsocks" and .port==8082)' "$XRAY_CONF" 2>/dev/null || true)"
+    if [ -n "$ssib" ]; then
+      local m pw b64
+      m="$(echo "$ssib" | jq -r '.settings.method')"; pw="$(echo "$ssib" | jq -r '.settings.password')"
+      b64="$(echo -n "${m}:${pw}" | base64 | tr -d '\n')"
+      purple "ss://${b64}@${SS_FIXED_IP}:8080?type=ws&security=none&host=${d}&path=%2Fssgo#$(url_encode "$ns")"; echo
+      cnt=$((cnt+1))
+    fi
+  fi
+  local sl
+  sl="$(jq -c '.inbounds[]? | select(.protocol=="socks")' "$XRAY_CONF" 2>/dev/null || true)"
+  if [ -n "$sl" ] && [ -n "$ip" ]; then
+    while read -r line; do
+      [ -z "$line" ] && continue
+      local p u pw n
+      p="$(echo "$line" | jq -r '.port')"; u="$(echo "$line" | jq -r '.settings.accounts[0].user')"; pw="$(echo "$line" | jq -r '.settings.accounts[0].pass')"
+      n="${BASE_FULL} - Socks5-${p}"
+      purple "socks5://${u}:${pw}@${ip}:${p}#$(url_encode "$n")"; echo
+      cnt=$((cnt+1))
+    done <<< "$sl"
+  fi
+  if [ -f "$HY2_STATE" ]; then
+    . "$HY2_STATE" 2>/dev/null || true
+    if [ -n "${PORT:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${PASS:-}" ]; then
+      local hn insecure="0" hy_host upmbps downmbps
+      hn="${BASE_FULL} - HY2"
+      if [ "${CERT_MODE:-cf}" = "self" ]; then insecure="1"; fi
+      hy_host="$ip"; [ -z "$hy_host" ] && hy_host="$DOMAIN"
+      upmbps="${UP:-50}"; downmbps="${DOWN:-250}"
+      [[ "$upmbps" =~ ^[0-9]+$ ]] || upmbps=50; [[ "$downmbps" =~ ^[0-9]+$ ]] || downmbps=250
+      if [ -n "${OBFS:-}" ]; then
+        purple "hysteria2://${PASS}@${hy_host}:${PORT}?sni=${DOMAIN}&insecure=${insecure}&obfs=salamander&obfs-password=${OBFS}&upmbps=${upmbps}&downmbps=${downmbps}#$(url_encode "$hn")"; echo
+      else
+        purple "hysteria2://${PASS}@${hy_host}:${PORT}?sni=${DOMAIN}&insecure=${insecure}&upmbps=${upmbps}&downmbps=${downmbps}#$(url_encode "$hn")"; echo
+      fi
+      cnt=$((cnt+1))
+    fi
+  fi
+  [ "$cnt" -eq 0 ] && yellow "暂无配置节点"
+  echo "=========================================="
+}
+
+# ========== Socks5 ==========
+manage_socks5(){
+  if [ ! -f "$XRAY_CONF" ]; then
+    cls; red "未检测到 Xray"
+    menu_item_auto "1" "安装Xray"; menu_item_auto "0" "返回"
+    prompt "请选择: " k
+    case "$k" in 1) install_xray || { red "安装失败"; pause; return; } ;; 0) return ;; *) return ;; esac
+  fi
+  ensure_dns_rule || { red "初始化失败"; pause; return; }
+  while true; do
+    cls
+    local list
+    list="$(jq -c '.inbounds[]? | select(.protocol=="socks")' "$XRAY_CONF" 2>/dev/null || true)"
+    echo -e "${C_WARN}=============== Socks5管理 ===============${C_RST}"
+    if [ -z "$list" ]; then
+      echo -e "当前: ${C_BAD}未配置${C_RST}"
+    else
+      echo "-----------------------------------------------"
+      echo "  端口    | 用户名    | 密码"
+      echo "-----------------------------------------------"
+      while read -r line; do
+        [ -z "$line" ] && continue
+        printf "  %-8s| %-10s| %s\n" \
+          "$(echo "$line" | jq -r '.port')" \
+          "$(echo "$line" | jq -r '.settings.accounts[0].user')" \
+          "$(echo "$line" | jq -r '.settings.accounts[0].pass')"
+      done <<< "$list"
+    fi
+    echo "-----------------------------------------------"
+    menu_item_auto "1" "安装Socks5"; menu_item_auto "2" "修改Socks5"; menu_item_auto "3" "卸载Socks5"; menu_item_auto "0" "返回"
+    echo "==============================================="
+    prompt "请选择: " c
+    case "$c" in
+      1)
+        prompt "端口: " p; prompt "用户名: " u; prompt "密码: " pw
+        if [[ "$p" =~ ^[0-9]+$ && -n "$u" && -n "$pw" ]]; then
+          local ex; ex="$(jq --argjson p "$p" '[.inbounds[]? | select(.port==$p)] | length' "$XRAY_CONF")"
+          if [ "$ex" -gt 0 ]; then red "端口已存在"
+          else
+            update_xray --argjson p "$p" --arg u "$u" --arg pw "$pw" \
+              '.inbounds += [{"tag":("socks-"+($p|tostring)),"port":$p,"listen":"0.0.0.0","protocol":"socks","settings":{"auth":"password","accounts":[{"user":$u,"pass":$pw}],"udp":true},"sniffing":{"enabled":true,"destOverride":["http","tls"],"metadataOnly":false}}]'
+            svc restart xray; ask_enable_youtube_strict; green "添加成功"
+          fi
+        else red "输入无效"; fi; pause ;;
+      2)
+        # 修改Socks5：从列表中选择
+        if [ -z "$list" ]; then
+          red "当前无可修改的Socks5配置"; pause; continue
+        fi
+        echo "请选择要修改的Socks5配置："
+        echo "$list" | jq -r '.[] | "端口: \(.port), 用户名: \(.settings.accounts[0].user)"' | nl -w2 -s'. '
+        echo "0. 取消"
+        prompt "请输入序号: " idx
+        if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -gt 0 ]; then
+          local selected_line
+          selected_line="$(echo "$list" | jq -n --argjson idx "$((idx-1))" 'input | .[$idx]')"
+          local port user pass
+          port="$(echo "$selected_line" | jq -r '.port')"
+          user="$(echo "$selected_line" | jq -r '.settings.accounts[0].user')"
+          pass="$(echo "$selected_line" | jq -r '.settings.accounts[0].pass')"
+          green "当前配置 - 端口: $port, 用户名: $user"
+          prompt "新用户名: " new_user; [ -z "$new_user" ] && new_user="$user"
+          prompt "新密码: " new_pass; [ -z "$new_pass" ] && new_pass="$pass"
+          update_xray --argjson p "$port" --arg u "$new_user" --arg pw "$new_pass" \
+            '(.inbounds[]? | select(.protocol=="socks" and .port==$p) | .settings.accounts[0]) |= {"user":$u,"pass":$pw}'
+          svc restart xray; green "修改成功"
+        else
+          red "输入无效或已取消"; pause
+        fi
+        ;;
+      3)
+        if [ -z "$list" ]; then red "无可删项"; pause; continue; fi
+        local i=1; declare -a ports=()
+        while read -r line; do
+          [ -z "$line" ] && continue
+          local p; p="$(echo "$line" | jq -r '.port')"
+          echo "  ${i}. 端口 ${p}"; ports[$i]="$p"; i=$((i+1))
+        done <<< "$list"
+        echo "  0. 取消"
+        prompt "序号: " idx
+        if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -gt 0 ] && [ "$idx" -lt "$i" ]; then
+          update_xray --argjson p "${ports[$idx]}" 'del(.inbounds[]? | select(.protocol=="socks" and .port==$p))'
+          svc restart xray; green "已删除"
+        fi; pause ;;
+      0) return ;;
+      *) red "无效"; pause ;;
+    esac
+  done
+}
+
+# ========== Live logs ==========
+foreground_xray_log(){
+  [ -x "$XRAY_BIN" ] || { red "xray 未安装"; pause; return 1; }
+  [ -f "$XRAY_CONF" ] || { red "缺少配置: $XRAY_CONF"; pause; return 1; }
+  local bak="${XRAY_CONF}.bak.fg.$(date +%s)"
+  cp -a "$XRAY_CONF" "$bak"
+  if ! jq '.log=(.log//{})|.log.access=""|.log.error=""|.log.loglevel="debug"|.log.dnsLog=true' "$XRAY_CONF" > "${XRAY_CONF}.tmp"; then
+    red "写入 Xray 日志配置失败"; rm -f "${XRAY_CONF}.tmp" "$bak"; pause; return 1
+  fi
+  mv "${XRAY_CONF}.tmp" "$XRAY_CONF"
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_check_fg.log 2>&1; then
+    red "Xray 配置校验失败，无法前台运行"; cp -f "$bak" "$XRAY_CONF"; rm -f "$bak"
+    tail -n 80 /tmp/xray_check_fg.log 2>/dev/null || true; pause; return 1
+  fi
+  yellow "即将停止 xray 后台服务并前台输出日志..."
+  svc stop xray || true; pkill -f "^${XRAY_BIN} run -c ${XRAY_CONF}$" >/dev/null 2>&1 || true; pkill -x xray >/dev/null 2>&1 || true; sleep 1
+  green "前台日志已启动（Ctrl+C 退出）"; echo "日志文件: /tmp/xray-live.log"
+  local old_int_trap; old_int_trap="$(trap -p INT || true)"; trap ':' INT
+  set +e; "$XRAY_BIN" run -c "$XRAY_CONF" 2>&1 | tee /tmp/xray-live.log; set -e
+  if [ -n "$old_int_trap" ]; then eval "$old_int_trap"; else trap - INT; fi
+  cp -f "$bak" "$XRAY_CONF"; rm -f "$bak"
+  yellow "已退出前台日志，正在恢复后台服务..."
+  svc start xray || true; sleep 1; is_running xray && green "xray 已恢复后台运行" || red "xray 恢复失败，请手动检查"; pause
+}
+
+# ========== Service Monitor (Revised) ==========
+setup_service_monitor(){
+  local svcname="tunnel-argo"
+  if ! service_exists "$svcname"; then
+    red "服务 $svcname 未安装"; return 1
+  fi
+  yellow "开始设置服务监控（$svcname），每10分钟进行连通性检测"
+  local monitor_script="${WORK}/monitor_argo.sh"
+  local monitor_pid_file="${WORK}/monitor_argo.pid"
+  
+  if [ -f "$monitor_pid_file" ]; then
+    local old_pid; old_pid="$(cat "$monitor_pid_file" 2>/dev/null || true)"
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      green "监控进程已在运行 (PID: $old_pid)"; return 0
+    else
+      rm -f "$monitor_pid_file"
+    fi
+  fi
+
+  cat > "$monitor_script" <<'MONITOR_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+SVCNAME="tunnel-argo"
+WORK="/etc/xray"
+PIDFILE="${WORK}/monitor_argo.pid"
+LOG="${WORK}/monitor_argo.log"
+CHECK_INTERVAL=600
+RETRY_INTERVAL=20
+MAX_RETRIES=3
+RESTART_DELAY=60
+WAIT_AFTER_FAILURE=600
+HEALTH_CHECK_CMD="cloudflared tunnel --url http://localhost:2000/healthcheck"
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 监控启动: $SVCNAME" >> "$LOG"
+
+while true; do
+  local check_failed=0
+  for ((i=1; i<=MAX_RETRIES; i++)); do
+    # 使用官方健康检查命令
+    if $HEALTH_CHECK_CMD >/dev/null 2>&1; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 服务 $SVCNAME 健康检查通过 (第${i}次检查)" >> "$LOG"
+      check_failed=0
+      break
+    else
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 服务 $SVCNAME 健康检查失败 (第${i}次检查)" >> "$LOG"
+      check_failed=1
+      if [ "$i" -lt "$MAX_RETRIES" ]; then
+        sleep "$RETRY_INTERVAL"
+      fi
+    fi
+  done
+
+  if [ "$check_failed" -eq 1 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 连续${MAX_RETRIES}次健康检查失败，重启服务..." >> "$LOG"
+    svc restart "$SVCNAME" || true
+    sleep "$RESTART_DELAY"
+    if is_running "$SVCNAME"; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 重启后服务已运行" >> "$LOG"
+    else
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 重启后服务仍未运行，等待${WAIT_AFTER_FAILURE}秒后再次尝试..." >> "$LOG"
+      sleep "$WAIT_AFTER_FAILURE"
+      svc restart "$SVCNAME" || true
+      sleep 10
+      if is_running "$SVCNAME"; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 等待后重启成功" >> "$LOG"
+      else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 等待后重启仍失败，等待下一轮监控周期" >> "$LOG"
+      fi
+    fi
+  fi
+
+  sleep "$CHECK_INTERVAL"
+done
+MONITOR_SCRIPT
+
+  chmod +x "$monitor_script"
+  nohup "$monitor_script" >/dev/null 2>&1 &
+  echo $! > "$monitor_pid_file"
+  green "服务监控已设置，监控日志: ${WORK}/monitor_argo.log"
+  green "监控进程 PID: $(cat "$monitor_pid_file")"
+  green "健康检查使用命令: $HEALTH_CHECK_CMD"
+}
+
+stop_service_monitor(){
+  local monitor_pid_file="${WORK}/monitor_argo.pid"
+  if [ -f "$monitor_pid_file" ]; then
+    local pid; pid="$(cat "$monitor_pid_file" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      rm -f "$monitor_pid_file"
+      green "服务监控已停止"
+    else
+      rm -f "$monitor_pid_file"
+      yellow "监控进程未运行"
+    fi
+  else
+    yellow "未设置服务监控"
+  fi
+}
+
+# ========== SWAP ==========
+swap_cleanup_fstab(){ [ -f /etc/fstab ] && sed -i '/^\/swapfile[[:space:]]/d' /etc/fstab; }
+swap_disable_all(){
+  awk 'NR>1{print $1}' /proc/swaps 2>/dev/null | while read -r d; do [ -n "$d" ] && swapoff "$d" >/dev/null 2>&1 || true; done
+  [ -f /swapfile ] && rm -f /swapfile; swap_cleanup_fstab
+  if [ -d /sys/class/zram-control ] || [ -e /dev/zram0 ]; then
+    for z in /sys/block/zram*; do [ -d "$z" ] || continue; echo 1 > "$z/reset" 2>/dev/null || true; done
+  fi
+}
+zram_supported(){
+  [ -e /dev/zram0 ] && return 0
+  command -v modprobe >/dev/null 2>&1 && modprobe zram >/dev/null 2>&1 || true
+  [ -e /dev/zram0 ] && return 0
+  [ -w /sys/class/zram-control/hot_add ] && return 0
+  return 1
+}
+create_zram_swap(){
+  local mb="$1" zdev=""
+  if [ -e /dev/zram0 ]; then zdev="/dev/zram0"
+  elif [ -w /sys/class/zram-control/hot_add ]; then
+    local id; id="$(cat /sys/class/zram-control/hot_add 2>/dev/null || true)"; [ -n "$id" ] && zdev="/dev/zram${id}"
+  fi
+  [ -z "$zdev" ] && return 1
+  local zn="${zdev#/dev/}"
+  echo 1 > "/sys/block/${zn}/reset" 2>/dev/null || true
+  [ -w "/sys/block/${zn}/comp_algorithm" ] && echo lz4 > "/sys/block/${zn}/comp_algorithm" 2>/dev/null || true
+  echo "$((mb*1024*1024))" > "/sys/block/${zn}/disksize" 2>/dev/null || return 1
+  mkswap "$zdev" >/dev/null 2>&1 || return 1
+  swapon "$zdev" >/dev/null 2>&1 || return 1
+}
+create_swap_dd(){
+  local mb="$1"
+  dd if=/dev/zero of=/swapfile bs=1M count="$mb" status=none 2>"$SWAP_LOG" || return 1
+  chmod 600 /swapfile || return 1; mkswap /swapfile >/dev/null 2>&1 || return 1; swapon /swapfile >/dev/null 2>&1 || return 1
+  grep -q "^/swapfile[[:space:]]" /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+}
+create_swap_fallocate(){
+  local mb="$1"
+  command -v fallocate >/dev/null 2>&1 || return 1
+  fallocate -l "${mb}M" /swapfile 2>"$SWAP_LOG" || return 1
+  chmod 600 /swapfile || return 1; mkswap -f /swapfile >/dev/null 2>&1 || return 1; swapon /swapfile >/dev/null 2>&1 || return 1
+  grep -q "^/swapfile[[:space:]]" /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+}
+create_swap_best(){
+  local mb="${1:-128}"
+  swap_disable_all
+  if zram_supported && create_zram_swap "$mb"; then green "SWAP成功(ZRAM ${mb}MB)"; return 0; fi
+  if create_swap_dd "$mb"; then green "SWAP成功(dd ${mb}MB)"; return 0; fi
+  rm -f /swapfile
+  if create_swap_fallocate "$mb"; then green "SWAP成功(fallocate ${mb}MB)"; return 0; fi
+  red "SWAP失败"; return 1
+}
+manage_swap(){
+  while true; do
+    cls
+    local ram sw
+    ram=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null); [ -z "$ram" ] && ram=0
+    sw=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null); [ -z "$sw" ] && sw=0
+    echo -e "${C_WARN}=============== SWAP管理 ===============${C_RST}"
+    echo "RAM: ${ram}MB  SWAP: ${sw}MB"
+    echo "-----------------------------------------------"
+    menu_item_auto "1" "安装SWAP"; menu_item_auto "2" "卸载SWAP"; menu_item_auto "0" "返回"
+    echo "==============================================="
+    prompt "请选择: " c
+    case "$c" in
+      1) prompt "大小MB(默认128): " mb; mb=${mb:-128}; [[ "$mb" =~ ^[0-9]+$ ]] && [ "$mb" -gt 0 ] && create_swap_best "$mb" || red "输入无效"; pause ;;
+      2) swap_disable_all; green "已清理"; pause ;;
+      0) return ;;
+      *) red "无效"; pause ;;
+    esac
+  done
+}
+
+# ========== Shortcut / Uninstall ==========
+install_shortcut(){
+  mkdir -p "$WORK"
+  local mark="${WORK}/.shortcut_done"
+  local local_script="${WORK}/manager.sh"
+  local dst="/usr/local/bin/ssgo"
+  local url1="${SCRIPT_URL:-https://raw.githubusercontent.com/KisThFir/Xray-ssgo/refs/heads/main/Xray_ssgo.sh}"
+  local url2="https://raw.githubusercontent.com/KisThFir/Xray-ssgo/main/Xray_ssgo.sh"
+  yellow "正在拉取脚本到本地: ${local_script}"
+  if ! smart_download "$local_script" "$url1" 5000; then
+    yellow "主地址失败，尝试备用地址..."
+    smart_download "$local_script" "$url2" 5000 || { red "拉取失败: $url1"; return 1; }
+  fi
+  chmod 755 "$WORK" 2>/dev/null || true
+  chmod 700 "$local_script" 2>/dev/null || chmod +x "$local_script" || true
+  chown root:root "$local_script" 2>/dev/null || true
+  mkdir -p /usr/local/bin /usr/bin
+  cat > "$dst" <<'EOF'
+#!/usr/bin/env bash
+exec bash /etc/xray/manager.sh "$@"
+EOF
+  chmod 755 "$dst"; chown root:root "$dst" 2>/dev/null || true
+  ln -sf "$dst" /usr/bin/ssgo; chmod 755 /usr/bin/ssgo 2>/dev/null || true; chown -h root:root /usr/bin/ssgo 2>/dev/null || true
+  touch "$mark"; chmod 600 "$mark" 2>/dev/null || true
+  green "快捷方式已创建：ssgo -> /etc/xray/manager.sh"
+}
+full_uninstall(){
+  svc stop tunnel-argo; svc disable tunnel-argo
+  svc stop xray; svc disable xray
+  stop_service_monitor || true
+  pkill -f '/etc/xray/argo tunnel' >/dev/null 2>&1 || true
+  pkill -x xray >/dev/null 2>&1 || true
+  rm -f /etc/init.d/tunnel-argo /etc/systemd/system/tunnel-argo.service
+  rm -f /etc/init.d/xray /etc/systemd/system/xray.service
+  command -v systemctl >/dev/null 2>&1 && {
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+  }
+  command -v crontab >/dev/null 2>&1 && \
+    (crontab -l 2>/dev/null | sed '/#svc-restart-all/d') | crontab - 2>/dev/null || true
+  swap_disable_all >/dev/null 2>&1 || true
+  rm -f /usr/local/bin/ssgo /usr/bin/ssgo
+  rm -rf "$WORK" "$SB"
+  rm -rf /etc/ssgo
+  green "已彻底卸载（服务/配置/快捷方式/监控/SWAP 已清理）"
+}
+
+# ========== Outbound menu (Revised) ==========
+manage_outbound_menu(){
+  while true; do
+    cls
+    local v6_list_json v6_disp
+    v6_list_json="$(build_v6_domains_json)"
+    v6_disp="$(echo "$v6_list_json" | jq -r 'join(",")')"
+    [ -z "$v6_disp" ] && v6_disp="（空）"
+    echo -e "${C_WARN}========== 出站管理（Xray）==========${C_RST}"
+    echo -e "默认出站: \033[1;36mIPv4\033[0m"
+    echo -e "IPv6出站(严格): \033[1;36m${v6_disp}\033[0m"
+    echo -e "YouTube V6出站: \033[1;36m$( [ "$YOUTUBE_MODE" = "2" ] && echo '开启(严格)' || echo '关闭' )\033[0m"
+    echo "-----------------------------------------------"
+    menu_item_auto "1" "设置YouTube V6出站"; menu_item_auto "2" "管理IPv6出站列表"; menu_item_auto "0" "返回"
+    echo "==============================================="
+    prompt "请选择: " c
+    case "$c" in
+      1)
+        prompt "输入模式(1=关闭 2=开启(严格)): " m
+        case "$m" in
+          1) YOUTUBE_MODE=1; green "已关闭YouTube V6出站" ;;
+          2) YOUTUBE_MODE=2; green "已开启YouTube V6出站(严格)" ;;
+          *) red "输入无效" ;;
+        esac
+        save_outbound; apply_policy_all; pause ;;
+      2)
+        while true; do
+          cls
+          local list_json list_disp
+          list_json="$(build_v6_domains_json)"
+          list_disp="$(echo "$list_json" | jq -r 'join(",")')"
+          [ -z "$list_disp" ] && list_disp="（空）"
+          echo -e "${C_WARN}===== IPv6出站列表（严格） =====${C_RST}"
+          echo -e "当前列表: \033[1;36m${list_disp}\033[0m"
+          echo "-----------------------------------------------"
+          menu_item_auto "1" "添加域名"; menu_item_auto "2" "删除域名"; menu_item_auto "0" "返回"
+          echo "==============================================="
+          prompt "请选择: " d
+          case "$d" in
+            1)
+              prompt "输入域名(逗号分隔，支持批量): " s
+              [ -z "$s" ] && { red "不能为空"; pause; continue; }
+              if [ -z "$V6_SITES" ]; then
+                V6_SITES="$s"
+              else
+                V6_SITES="${V6_SITES},${s}"
+              fi
+              V6_SITES="$(echo "$V6_SITES" | sed 's/,,/,/g; s/^,//; s/,$//')"
+              save_outbound; apply_policy_all; green "已添加并应用"; pause ;;
+            2)
+              if [ "$(echo "$list_json" | jq 'length')" -eq 0 ]; then red "列表为空"; pause; continue; fi
+              echo "当前IPv6出站域名："
+              echo "$list_json" | jq -r '.[]' | nl -w2 -s'. '
+              echo "输入序号（支持 1,3,5 ）或 a 全删，0取消"
+              prompt "输入: " list
+              if [[ "$list" =~ ^[aA]$ ]]; then
+                V6_SITES=""
+                save_outbound; apply_policy_all; green "已全删并应用"; pause; continue
+              fi
+              [ "$list" = "0" ] && continue
+              local IFS=',' one target delset=""
+              for one in $list; do
+                one="$(echo "$one" | sed 's/ //g')"
+                [[ "$one" =~ ^[0-9]+$ ]] || continue
+                target="$(echo "$list_json" | jq -r ".[$((one-1))] // empty")"
+                [ -n "$target" ] && delset="${delset}${target}"$'\n'
+              done
+              [ -z "$delset" ] && { red "无有效序号"; pause; continue; }
+              local new_json
+              new_json="$(echo "$list_json" | jq -r --argjson delset "$(echo "$delset" | jq -Rsc 'split("\n") | map(select(length>0))')" '. - $delset')"
+              V6_SITES="$(echo "$new_json" | jq -r 'join(",")')"
+              save_outbound; apply_policy_all; green "已删除并应用"; pause ;;
+            0) break ;;
+            *) red "无效"; pause ;;
+          esac
+        done ;;
+      0) return ;;
+      *) red "无效"; pause ;;
+    esac
+  done
+}
+
+# ========== Xray menu ==========
+xray_menu(){
+  while true; do
+    cls
+    local xs as hs
+    if [ -x "$XRAY_BIN" ]; then xs=$(is_running xray && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else xs="${C_BAD}未安装${C_RST}"; fi
+    if service_exists tunnel-argo; then as=$(is_running tunnel-argo && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else as="${C_BAD}未配置${C_RST}"; fi
+    if [ -f "$HY2_STATE" ]; then hs="\033[1;36m已配置\033[0m"; else hs="${C_BAD}未配置${C_RST}"; fi
+    echo -e "${C_OK}=============== Xray管理 ===============${C_RST}"
+    echo -e "Xray: ${xs}   Argo: ${as}   HY2: ${hs}"
+    echo "-----------------------------------------------"
+    menu_row2_auto "1"  "安装Argo"      "8"  "实时日志"
+    menu_row2_auto "2"  "安装HY2"       "9"  "查看节点"
+    menu_row2_auto "3"  "配置Socks5"    "10" "修改UUID"
+    menu_row2_auto "4"  "重启Argo"      "0"  "返回"
+    menu_row2_auto "5"  "重启Xray"
+    menu_row2_auto "6"  "卸载Argo"
+    menu_row2_auto "7"  "卸载HY2"
+    menu_row2_auto "11" "重装HY2"
+    echo "==============================================="
+    prompt "请选择: " c
+    case "$c" in
+      1) install_argo; pause ;;
+      2) install_hy2; pause ;;
+      3) manage_socks5 ;;
+      4) service_exists tunnel-argo && svc restart tunnel-argo && green "Argo 已重启" || red "Argo未安装"; pause ;;
+      5) service_exists xray && svc restart xray && green "Xray 已重启" || red "Xray未安装"; pause ;;
+      6) uninstall_argo; pause ;;
+      7) uninstall_hy2; pause ;;
+      8) foreground_xray_log ;;
+      9) show_xray_nodes; pause ;;
+      10) prompt "新UUID(回车自动): " u; [ -z "$u" ] && u="$(gen_uuid)"; set_xray_uuid "$u"; pause ;;
+      11) reinstall_hy2; pause ;;
+      0) return ;;
+      *) red "无效"; pause ;;
+    esac
+  done
+}
+
+# ========== System info ==========
+detect_virt_name(){
+  local v=""
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    v="$(systemd-detect-virt 2>/dev/null || true)"
+    [ -n "$v" ] && [ "$v" != "none" ] && { echo "${v^^}"; return; }
+  fi
+  if [ -f /run/systemd/container ]; then
+    v="$(cat /run/systemd/container 2>/dev/null || true)"
+    [ -n "$v" ] && { echo "${v^^}"; return; }
+  fi
+  if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=lxc$'; then echo "LXC"; return; fi
+  if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=docker$'; then echo "DOCKER"; return; fi
+  if grep -qaE '(lxc|docker|containerd|kubepods|podman)' /proc/1/cgroup 2>/dev/null; then
+    if grep -qa 'lxc' /proc/1/cgroup 2>/dev/null; then echo "LXC"; return; fi
+    if grep -qa 'docker' /proc/1/cgroup 2>/dev/null; then echo "DOCKER"; return; fi
+    if grep -qa 'containerd' /proc/1/cgroup 2>/dev/null; then echo "CONTAINERD"; return; fi
+    if grep -qa 'podman' /proc/1/cgroup 2>/dev/null; then echo "PODMAN"; return; fi
+    echo "CONTAINER"; return
+  fi
+  [ -f /proc/1/ns/mnt ] && [ -d /dev/lxd ] && { echo "LXC"; return; }
+  echo "UNKNOWN"
+}
+arch_disp(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo "x64" ;; i?86) echo "x86" ;; aarch64|arm64) echo "arm64" ;; armv7l|armv7|armhf) echo "armv7" ;; armv6l|armv6) echo "armv6" ;; s390x) echo "s390x" ;; riscv64) echo "riscv64" ;; *) uname -m ;;
+  esac
+}
+os_version_disp(){
+  local osv
+  if is_alpine; then osv="Alpine $(cat /etc/alpine-release 2>/dev/null || echo "")"
+  elif [ -f /etc/os-release ]; then
+    . /etc/os-release
+    if [ -n "${ID:-}" ] && [ -n "${VERSION_ID:-}" ]; then osv="$(echo "$ID" | sed 's/^[a-z]/\U&/') ${VERSION_ID}"; else osv="${PRETTY_NAME:-Linux}"; fi
+  else osv="Linux"; fi
+  echo "$osv"
+}
+kernel_disp(){ cut -d- -f1 < /proc/sys/kernel/osrelease 2>/dev/null || uname -r; }
+cpu_model_disp(){
+  local model
+  model="$(awk -F: '
+    /model name/ {gsub(/^[ \t]+/, "", $2); print $2; exit}
+    /Hardware/   {gsub(/^[ \t]+/, "", $2); print $2; exit}
+    /Processor/  {gsub(/^[ \t]+/, "", $2); print $2; exit}
+  ' /proc/cpuinfo 2>/dev/null)"
+  [ -z "$model" ] && model="$(uname -m)"; echo "$model"
+}
+cpu_cores_disp(){ nproc 2>/dev/null || awk '/^processor/{n++} END{print (n?n:1)}' /proc/cpuinfo 2>/dev/null; }
+cpu_usage_percent(){
+  local user nice system idle iowait irq softirq steal guest guest_nice
+  local total idle_all diff_total diff_idle usage
+  local s1_total s1_idle s2_total s2_idle
+  read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+  total=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle_all=$((idle+iowait))
+  if [ "${CPU_LAST_TOTAL:-0}" -eq 0 ] || [ "${CPU_LAST_IDLE:-0}" -eq 0 ]; then
+    s1_total="$total"; s1_idle="$idle_all"; sleep 0.2
+    read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+    s2_total=$((user+nice+system+idle+iowait+irq+softirq+steal)); s2_idle=$((idle+iowait))
+    diff_total=$((s2_total-s1_total)); diff_idle=$((s2_idle-s1_idle))
+    CPU_LAST_TOTAL="$s2_total"; CPU_LAST_IDLE="$s2_idle"
+    if [ "$diff_total" -le 0 ]; then echo "0"; return; fi
+    usage=$(( (100*(diff_total-diff_idle))/diff_total )); [ "$usage" -lt 0 ] && usage=0; [ "$usage" -gt 100 ] && usage=100; echo "$usage"; return
+  fi
+  diff_total=$((total-CPU_LAST_TOTAL)); diff_idle=$((idle_all-CPU_LAST_IDLE))
+  CPU_LAST_TOTAL="$total"; CPU_LAST_IDLE="$idle_all"
+  if [ "$diff_total" -le 0 ]; then echo "0"; return; fi
+  usage=$(( (100*(diff_total-diff_idle))/diff_total )); [ "$usage" -lt 0 ] && usage=0; [ "$usage" -gt 100 ] && usage=100; echo "$usage"
+}
+mem_swap_used_disp(){
+  awk '
+    /MemTotal/      {mt=$2}
+    /MemAvailable/  {ma=$2}
+    /SwapTotal/     {st=$2}
+    /SwapFree/      {sf=$2}
+    END{
+      mu=mt-ma;
+      if (mt>1024*1024) mtxt=sprintf("%.1fG/%.1fG", mu/1024/1024, mt/1024/1024);
+      else              mtxt=sprintf("%.0fM/%.0fM", mu/1024, mt/1024);
+      if (st>0) {
+        su=st-sf;
+        if (st>1024*1024) stxt=sprintf("%.1fG/%.1fG", su/1024/1024, st/1024/1024);
+        else              stxt=sprintf("%.0fM/%.0fM", su/1024, st/1024);
+      } else {
+        stxt="";
+      }
+      printf "%s|%s", mtxt, stxt;
+    }
+  ' /proc/meminfo 2>/dev/null
+}
+
+# ========== Main ==========
+main_menu(){
+  ensure_deps || { red "依赖安装失败，请检查网络/源"; exit 1; }
+  mkdir -p "$WORK"
+  load_state
+  load_ip_cache >/dev/null 2>&1 || true
+  [ "$IP_CHECKED" = "1" ] || {
+    cls; echo -e "\033[1;33mIP信息加载中，请稍候...\033[0m"
+    check_ip || { red "IP检测失败，已跳过（不影响进入菜单）"; sleep 1; }
+  }
+  while true; do
+    cls
+    [ -f "$IPCACHE" ] && {
+      local mt
+      mt=$(stat -c %Y "$IPCACHE" 2>/dev/null || echo 0)
+      [ "$mt" -gt "${IP_CACHE_MTIME:-0}" ] && IP_CACHE_MTIME="$mt" && load_ip_cache >/dev/null 2>&1 || true
+    }
+    local osver arch ker virt cpu_model cpu_cores cpu_use ms u4 u6
+    local mem swap
+    osver="$(os_version_disp)"; arch="$(arch_disp)"; ker="$(kernel_disp)"; virt="$(detect_virt_name)"
+    cpu_model="$(cpu_model_disp)"; cpu_cores="$(cpu_cores_disp)"; cpu_use="$(cpu_usage_percent)"
+    ms="$(mem_swap_used_disp)"; mem="${ms%%|*}"; swap="${ms#*|}"
+    if [ -n "${WAN4:-}" ]; then
+      u4="${EMOJI4} ${COUNTRY4} ${WAN4}"
+      [ -n "${ISP4:-}" ] && [ "${ISP4}" != "unknown" ] && u4="${u4} | ${ISP4}"
+      u4="\033[1;36m${u4}\033[0m"
+    else
+      u4="${C_BAD}未检测到${C_RST}"
+    fi
+    if [ -n "${WAN6:-}" ]; then
+      u6="${EMOJI6} ${COUNTRY6} ${WAN6}"
+      [ -n "${ISP6:-}" ] && [ "${ISP6}" != "unknown" ] && u6="${u6} | ${ISP6}"
+      u6="\033[1;36m${u6}\033[0m"
+    else
+      u6="${C_BAD}未检测到${C_RST}"
+    fi
+    echo -e "${C_DIM}================ 系统信息 ================${C_RST}"
+    echo -e "OS   : \033[1;36m${osver} | ${arch} | ${ker} | ${virt}\033[0m"
+    echo -e "CPU  : \033[1;36m${cpu_model} | ${cpu_cores}C | ${cpu_use}%\033[0m"
+    echo -e "Mem  : \033[1;36m${mem}\033[0m"
+    [ -n "$swap" ] && echo -e "Swap : \033[1;36m${swap}\033[0m"
+    echo "-----------------------------------------------"
+    echo -e "IPv4 : ${u4}"
+    echo -e "IPv6 : ${u6}"
+    echo "-----------------------------------------------"
+    echo -e "${C_DIM}==========================================${C_RST}"
+    echo
+    menu_row2_auto "1" "管理Xray"   "6" "管理SWAP"
+    menu_row2_auto "2" "管理出站"   "8" "创建快捷"
+    menu_row2_auto "3" "服务监控"   "9" "彻底卸载"
+    menu_row2_auto "0" "退出"
+    echo "==============================================="
+    prompt "请选择: " c
+    case "$c" in
+      1) xray_menu ;;
+      2) manage_outbound_menu ;;
+      3) setup_service_monitor; pause ;;
+      0) cls; exit 0 ;;
+      6) manage_swap ;;
+      8) install_shortcut; pause ;;
+      9) full_uninstall; pause ;;
+      
+      *) red "无效"; pause ;;
+    esac
+  done
+}
+trap 'echo; cls; red "已中断"; exit 130' INT TERM
+main_menu
