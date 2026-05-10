@@ -336,9 +336,7 @@ check_ip(){
   IP_CHECKED=1; save_ip_cache || true
   return 0
 }
-pick_node_host(){
-  if [ -n "${WAN6:-}" ]; then echo "[${WAN6}]"; elif [ -n "${WAN4:-}" ]; echo "${WAN4}"; else echo ""; fi
-}
+pick_node_host(){ if [ -n "${WAN6:-}" ]; then echo "[${WAN6}]"; elif [ -n "${WAN4:-}" ]; then echo "${WAN4}"; else echo ""; fi; }
 
 # ========== Domain helpers ==========
 normalize_domain_item(){ local s="$1"; s="${s#http://}"; s="${s#https://}"; s="${s%%/*}"; s="${s%%:*}"; s="$(echo "$s" | tr '[:upper:]' '[:lower:]' | sed 's/^ *//;s/ *$//;s/^\.*//')"; echo "$s"; }
