@@ -84,7 +84,7 @@ WORK="/etc/xray"
 XRAY_BIN="${WORK}/xray"
 XRAY_CONF="${WORK}/config.json"
 
-TLS_BASE="/etc/ssgo/tls"
+TLS_BASE="/etc/lite/tls"
 TLS_DIR_HY2="${TLS_BASE}/hy2"
 
 ARGO_DOMAIN="${WORK}/domain_argo.txt"
@@ -101,6 +101,9 @@ SWAP_LOG="/tmp/swap.log"
 UUID_FALLBACK="$(cat /proc/sys/kernel/random/uuid)"
 CFIP=${CFIP:-'172.67.146.150'}
 SS_FIXED_IP="172.64.147.74"
+
+XHTTP_MODE="auto"
+XHTTP_EXTRA_JSON='{"xPaddingObfsMode":true,"xPaddingMethod":"tokenish","xPaddingPlacement":"queryInHeader","xPaddingHeader":"y2k","xPaddingKey":"_y2k"}'
 
 HY2_SELF_SNI_DEFAULT="www.amd.com"
 
@@ -217,6 +220,40 @@ smart_download(){
 update_xray(){
   if ! jq "$@" "$XRAY_CONF" > "${XRAY_CONF}.tmp"; then rm -f "${XRAY_CONF}.tmp"; red "配置更新失败"; return 1; fi
   mv "${XRAY_CONF}.tmp" "$XRAY_CONF"
+}
+ensure_acme(){
+  need_cmd openssl || pkg_install openssl
+  command -v openssl >/dev/null 2>&1 || { red "缺少 openssl，无法安装 acme.sh"; return 1; }
+  [ -x "$HOME/.acme.sh/acme.sh" ] && return 0
+
+  if ! command -v crontab >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      pkg_install cron; svc enable cron; svc start cron
+    elif command -v apk >/dev/null 2>&1; then
+      pkg_install dcron
+      rc-service dcron start >/dev/null 2>&1 || true
+      rc-update add dcron default >/dev/null 2>&1 || true
+    else
+      pkg_install cronie; svc enable crond; svc start crond
+    fi
+  fi
+
+  yellow "安装 acme.sh..."
+  curl -s https://get.acme.sh | sh >/tmp/acme_install.log 2>&1 || true
+  [ -x "$HOME/.acme.sh/acme.sh" ] || {
+    red "acme.sh 安装失败"
+    tail -n 80 /tmp/acme_install.log 2>/dev/null || true
+    return 1
+  }
+}
+
+open_port(){
+  local p="$1" proto="${2:-tcp}"
+  command -v ufw >/dev/null 2>&1 && ufw allow "${p}/${proto}" >/dev/null 2>&1 || true
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --add-port="${p}/${proto}" --permanent >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
 }
 
 # ========== State ==========
@@ -561,12 +598,12 @@ EOF
   local ws xh ss
   ws='{"port":8080,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
   xh=$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" \
-      '{"port":8081,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')
+     '{"port":8081,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')
   ss='{"port":8082,"listen":"127.0.0.1","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
   update_xray --argjson ws "$ws" --argjson xh "$xh" --argjson ss "$ss" '.inbounds += [$ws,$xh,$ss]'
   [ -x "${WORK}/argo" ] || { red "cloudflared 不存在: ${WORK}/argo"; return 1; }
   local cmd svcname="tunnel-argo"
-  cmd="${WORK}/argo tunnel --edge-ip-version auto --no-autoupdate --config ${ARGO_YML} run"
+  cmd="${WORK}/argo tunnel --edge-ip-version auto --no-autoupdate --metrics 127.0.0.1:2000 --config ${ARGO_YML} run"
   if ! service_exists "$svcname"; then
     if is_alpine; then
       cat > "${WORK}/argo_start.sh" <<EOF
@@ -703,7 +740,7 @@ install_hy2(){
     yellow "一键最简模式：无混淆、默认50/250 Mbps（客户端可改）"
   fi
   open_port "$port" udp
-  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or ((.tag // "")|startswith("hy2-in-hop-")) or .protocol=="hysteria" or .protocol=="hysteria2"))'
+  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or .protocol=="hysteria" or .protocol=="hysteria2"))'
   local hy2
   if [ -n "$obfs" ]; then
     hy2="$(jq -nc \
@@ -768,46 +805,172 @@ install_hy2(){
   if [ "$mode" = "1" ]; then green "当前为一键最简：无混淆 / 默认50/250 Mbps"; else green "当前为自定义：UP=${up}Mbps DOWN=${down}Mbps"; fi
 }
 reinstall_hy2(){
-  if ! [ -f "$HY2_STATE" ]; then red "HY2 未安装，无需重装"; return; fi
-  local old_port; old_port="$(awk -F= '/^PORT=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
+  [ -f "$HY2_STATE" ] || { red "HY2 未安装，无需重装"; return; }
+
+  # 读取旧状态
+  local OLD_PORT OLD_DOMAIN OLD_PASS OLD_UP OLD_DOWN OLD_OBFS OLD_CERT_MODE
+  OLD_PORT="$(awk -F= '/^PORT=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
+  OLD_DOMAIN="$(awk -F= '/^DOMAIN=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
+  OLD_PASS="$(awk -F= '/^PASS=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
+  OLD_UP="$(awk -F= '/^UP=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
+  OLD_DOWN="$(awk -F= '/^DOWN=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
+  OLD_OBFS="$(awk -F= '/^OBFS=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
+  OLD_CERT_MODE="$(awk -F= '/^CERT_MODE=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
+
+  [ -z "$OLD_UP" ] && OLD_UP=50
+  [ -z "$OLD_DOWN" ] && OLD_DOWN=250
+  [[ "$OLD_UP" =~ ^[0-9]+$ ]] || OLD_UP=50
+  [[ "$OLD_DOWN" =~ ^[0-9]+$ ]] || OLD_DOWN=250
+  [ -z "$OLD_CERT_MODE" ] && OLD_CERT_MODE="cf"
+
+  cls
+  echo -e "${C_WARN}=============== HY2 重装模式 ===============${C_RST}"
+  echo "1) 继承旧配置（默认，仅更换端口）"
+  echo "2) 全新重装（可改证书/认证/混淆/带宽）"
+  echo "0) 取消"
+  echo "============================================"
+  local mode
+  prompt "请选择(默认1): " mode
+  [ -z "$mode" ] && mode=1
+
+  case "$mode" in
+    0) return ;;
+    1|2) ;;
+    *) red "输入无效"; return ;;
+  esac
+
+  # 先删旧 HY2 入站
   svc stop xray || true
   update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or .protocol=="hysteria" or .protocol=="hysteria2"))'
+
+  # 生成新端口（尽量避开旧端口和占用端口）
   local new_port
   while true; do
     new_port=$(( RANDOM % 65535 + 1 ))
     [[ "$new_port" -lt 1024 ]] && continue
-    [[ "$new_port" -eq "$old_port" ]] && continue
+    [ -n "$OLD_PORT" ] && [[ "$new_port" -eq "$OLD_PORT" ]] && continue
     if ! ss -tuln | grep -q ":${new_port} "; then
       break
     fi
   done
-  green "HY2旧端口: ${old_port}, 新端口: ${new_port}"
+
   install_xray || return 1
   ensure_dns_rule || return 1
-  local mode=1 cert_mode=1 domain auth port obfs up down cert_file key_file cert_mode_saved
-  prompt "证书模式(1=本机自签 2=CF令牌签发，默认1): " cert_mode
-  [ -z "${cert_mode:-}" ] && cert_mode=1; [[ "$cert_mode" =~ ^[12]$ ]] || cert_mode=1
-  if [ "$cert_mode" = "1" ]; then
-    prompt "HY2伪装域名(回车默认 ${HY2_SELF_SNI_DEFAULT}): " domain
+
+  local domain auth port obfs up down cert_mode_saved cert_file key_file token cert_mode
+
+  if [ "$mode" = "1" ]; then
+    # 继承模式：仅换端口
+    domain="$OLD_DOMAIN"
+    auth="$OLD_PASS"
+    obfs="$OLD_OBFS"
+    up="$OLD_UP"
+    down="$OLD_DOWN"
+    cert_mode_saved="$OLD_CERT_MODE"
+    port="$new_port"
+
+    # 必要兜底
     [ -z "$domain" ] && domain="$HY2_SELF_SNI_DEFAULT"
-    issue_cert_selfsigned "$domain" "$TLS_DIR_HY2" || return 1
-    cert_mode_saved="self"
+    [ -z "$auth" ] && auth="$(gen_uuid)"
+    [[ "$up" =~ ^[0-9]+$ ]] || up=50
+    [[ "$down" =~ ^[0-9]+$ ]] || down=250
+
+    cert_file="${TLS_DIR_HY2}/${domain}.crt"
+    key_file="${TLS_DIR_HY2}/${domain}.key"
+
+    # 继承模式下仅复用已有证书；缺失则提示走全新重装
+    if [ ! -s "$cert_file" ] || [ ! -s "$key_file" ]; then
+      red "继承模式失败：找不到旧证书文件"
+      yellow "请改用“全新重装”模式重新签发证书"
+      return 1
+    fi
+
+    green "继承模式：仅端口变更"
+    green "旧端口: ${OLD_PORT:-unknown} -> 新端口: ${port}"
   else
-    prompt "HY2域名: " domain; [ -z "$domain" ] && { red "域名不能为空"; return 1; }
-    prompt "Cloudflare API Token: " token; [ -z "$token" ] && { red "Token不能为空"; return 1; }
-    issue_cert_cf "$domain" "$token" "$TLS_DIR_HY2" || return 1
-    cert_mode_saved="cf"
+    # 全新重装：可改高级参数
+    prompt "证书模式(1=本机自签 2=CF令牌签发，默认1): " cert_mode
+    [ -z "${cert_mode:-}" ] && cert_mode=1
+    [[ "$cert_mode" =~ ^[12]$ ]] || cert_mode=1
+
+    if [ "$cert_mode" = "1" ]; then
+      prompt "HY2伪装域名(回车默认 ${HY2_SELF_SNI_DEFAULT}): " domain
+      [ -z "$domain" ] && domain="$HY2_SELF_SNI_DEFAULT"
+      issue_cert_selfsigned "$domain" "$TLS_DIR_HY2" || return 1
+      cert_mode_saved="self"
+    else
+      prompt "HY2域名: " domain; [ -z "$domain" ] && { red "域名不能为空"; return 1; }
+      prompt "Cloudflare API Token: " token; [ -z "$token" ] && { red "Token不能为空"; return 1; }
+      issue_cert_cf "$domain" "$token" "$TLS_DIR_HY2" || return 1
+      cert_mode_saved="cf"
+    fi
+
+    cert_file="${TLS_DIR_HY2}/${domain}.crt"
+    key_file="${TLS_DIR_HY2}/${domain}.key"
+
+    port="$new_port"
+    prompt "HY2认证AUTH(回车随机UUID): " auth
+    [ -z "$auth" ] && auth="$(gen_uuid)"
+
+    prompt "HY2混淆密码OBFS(回车留空=不启用混淆): " obfs
+
+    local prof
+    echo "带宽档位: 1.默认(50/250 Mbps) 2.自定义"
+    prompt "选择(默认1): " prof
+    case "$prof" in
+      2)
+        prompt "上行Mbps(默认50): " up
+        prompt "下行Mbps(默认250): " down
+        [ -z "$up" ] && up=50
+        [ -z "$down" ] && down=250
+        [[ "$up" =~ ^[0-9]+$ ]] || up=50
+        [[ "$down" =~ ^[0-9]+$ ]] || down=250
+        ;;
+      *)
+        up=50
+        down=250
+        ;;
+    esac
+
+    green "全新重装：旧端口 ${OLD_PORT:-unknown} -> 新端口 ${port}"
   fi
-  cert_file="${TLS_DIR_HY2}/${domain}.crt"; key_file="${TLS_DIR_HY2}/${domain}.key"
-  port="$new_port"; auth="$(gen_uuid)"; obfs=""; up=50; down=250
+
   open_port "$port" udp
+
   local hy2
-  hy2="$(jq -nc \
-    --argjson p "$port" \
-    --arg auth "$auth" \
-    --arg domain "$domain" \
-    --arg crt "$cert_file" \
-    --arg key "$key_file" \
+  if [ -n "$obfs" ]; then
+    hy2="$(jq -nc \
+      --argjson p "$port" \
+      --arg auth "$auth" \
+      --arg obfs "$obfs" \
+      --arg domain "$domain" \
+      --arg crt "$cert_file" \
+      --arg key "$key_file" \
+'{
+  "tag":"hy2-in",
+  "listen":"::",
+  "port":$p,
+  "protocol":"hysteria",
+  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
+  "streamSettings":{
+    "network":"hysteria",
+    "security":"tls",
+    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
+    "hysteriaSettings":{"version":2},
+    "finalmask":{
+      "udp":[{"type":"salamander","settings":{"password":$obfs}}],
+      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
+    }
+  },
+  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+}')"
+  else
+    hy2="$(jq -nc \
+      --argjson p "$port" \
+      --arg auth "$auth" \
+      --arg domain "$domain" \
+      --arg crt "$cert_file" \
+      --arg key "$key_file" \
 '{
   "tag":"hy2-in",
   "listen":"::",
@@ -825,18 +988,30 @@ reinstall_hy2(){
   },
   "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
 }')"
-  update_xray --argjson ib "$hy2" '.inbounds += [$ib]'
-  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_hy2_reinstall_check.log 2>&1; then
-    red "Xray 配置校验失败"; tail -n 80 /tmp/xray_hy2_reinstall_check.log 2>/dev/null || true; return 1
   fi
+
+  update_xray --argjson ib "$hy2" '.inbounds += [$ib]'
+
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_hy2_reinstall_check.log 2>&1; then
+    red "Xray 配置校验失败"
+    tail -n 80 /tmp/xray_hy2_reinstall_check.log 2>/dev/null || true
+    return 1
+  fi
+
   svc restart xray
   write_hy2_state "$port" "$domain" "$auth" "$up" "$down" "$obfs" "$cert_mode_saved"
-  ask_enable_youtube_strict
+
   green "HY2 重装成功（新端口: ${port}）"
+  if [ "$mode" = "1" ]; then
+    green "模式：继承旧配置，仅端口变更"
+  else
+    green "模式：全新重装（高级参数已生效）"
+  fi
 }
+
 uninstall_hy2(){
   [ -f "$XRAY_CONF" ] || { red "xray未安装"; return 1; }
-  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or (.tag|startswith("hy2-in-hop-")) or .protocol=="hysteria" or .protocol=="hysteria2"))'
+  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or .protocol=="hysteria" or .protocol=="hysteria2"))'
   rm -f "$HY2_STATE"
   svc restart xray; green "HY2 已卸载"
 }
@@ -903,88 +1078,202 @@ show_xray_nodes(){
 
 # ========== Socks5 ==========
 manage_socks5(){
+  # 若未安装 xray，先引导安装
   if [ ! -f "$XRAY_CONF" ]; then
-    cls; red "未检测到 Xray"
-    menu_item_auto "1" "安装Xray"; menu_item_auto "0" "返回"
+    cls
+    red "未检测到 Xray"
+    menu_item_auto "1" "安装Xray"
+    menu_item_auto "0" "返回"
     prompt "请选择: " k
-    case "$k" in 1) install_xray || { red "安装失败"; pause; return; } ;; 0) return ;; *) return ;; esac
+    case "$k" in
+      1) install_xray || { red "安装失败"; pause; return; } ;;
+      0) return ;;
+      *) return ;;
+    esac
   fi
+
   ensure_dns_rule || { red "初始化失败"; pause; return; }
+
   while true; do
     cls
+
+    # 读取 socks 入站列表（每行一个 JSON 对象）
     local list
     list="$(jq -c '.inbounds[]? | select(.protocol=="socks")' "$XRAY_CONF" 2>/dev/null || true)"
+
     echo -e "${C_WARN}=============== Socks5管理 ===============${C_RST}"
     if [ -z "$list" ]; then
       echo -e "当前: ${C_BAD}未配置${C_RST}"
     else
       echo "-----------------------------------------------"
-      echo "  端口    | 用户名    | 密码"
+      echo "  序号 | 端口    | 用户名      | 密码"
       echo "-----------------------------------------------"
-      while read -r line; do
+      local i=1
+      while IFS= read -r line; do
         [ -z "$line" ] && continue
-        printf "  %-8s| %-10s| %s\n" \
-          "$(echo "$line" | jq -r '.port')" \
-          "$(echo "$line" | jq -r '.settings.accounts[0].user')" \
-          "$(echo "$line" | jq -r '.settings.accounts[0].pass')"
+        local p u pw
+        p="$(echo "$line" | jq -r '.port // empty')"
+        u="$(echo "$line" | jq -r '.settings.accounts[0].user // empty')"
+        pw="$(echo "$line" | jq -r '.settings.accounts[0].pass // empty')"
+        printf "  %-4s| %-8s| %-12s| %s\n" "$i" "$p" "$u" "$pw"
+        i=$((i+1))
       done <<< "$list"
     fi
+
     echo "-----------------------------------------------"
-    menu_item_auto "1" "安装Socks5"; menu_item_auto "2" "修改Socks5"; menu_item_auto "3" "卸载Socks5"; menu_item_auto "0" "返回"
+    menu_item_auto "1" "安装Socks5"
+    menu_item_auto "2" "修改Socks5"
+    menu_item_auto "3" "卸载Socks5"
+    menu_item_auto "0" "返回"
     echo "==============================================="
     prompt "请选择: " c
+
     case "$c" in
       1)
-        prompt "端口: " p; prompt "用户名: " u; prompt "密码: " pw
-        if [[ "$p" =~ ^[0-9]+$ && -n "$u" && -n "$pw" ]]; then
-          local ex; ex="$(jq --argjson p "$p" '[.inbounds[]? | select(.port==$p)] | length' "$XRAY_CONF")"
-          if [ "$ex" -gt 0 ]; then red "端口已存在"
-          else
-            update_xray --argjson p "$p" --arg u "$u" --arg pw "$pw" \
-              '.inbounds += [{"tag":("socks-"+($p|tostring)),"port":$p,"listen":"0.0.0.0","protocol":"socks","settings":{"auth":"password","accounts":[{"user":$u,"pass":$pw}],"udp":true},"sniffing":{"enabled":true,"destOverride":["http","tls"],"metadataOnly":false}}]'
-            svc restart xray; ask_enable_youtube_strict; green "添加成功"
-          fi
-        else red "输入无效"; fi; pause ;;
-      2)
-        # 修改Socks5：从列表中选择
-        if [ -z "$list" ]; then
-          red "当前无可修改的Socks5配置"; pause; continue
+        local p u pw ex
+        prompt "端口(1-65535): " p
+        prompt "用户名: " u
+        prompt "密码: " pw
+
+        if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ] || [ -z "$u" ] || [ -z "$pw" ]; then
+          red "输入无效"
+          pause
+          continue
         fi
-        echo "请选择要修改的Socks5配置："
-        echo "$list" | jq -r '.[] | "端口: \(.port), 用户名: \(.settings.accounts[0].user)"' | nl -w2 -s'. '
-        echo "0. 取消"
-        prompt "请输入序号: " idx
-        if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -gt 0 ]; then
-          local selected_line
-          selected_line="$(echo "$list" | jq -n --argjson idx "$((idx-1))" 'input | .[$idx]')"
-          local port user pass
-          port="$(echo "$selected_line" | jq -r '.port')"
-          user="$(echo "$selected_line" | jq -r '.settings.accounts[0].user')"
-          pass="$(echo "$selected_line" | jq -r '.settings.accounts[0].pass')"
-          green "当前配置 - 端口: $port, 用户名: $user"
-          prompt "新用户名: " new_user; [ -z "$new_user" ] && new_user="$user"
-          prompt "新密码: " new_pass; [ -z "$new_pass" ] && new_pass="$pass"
-          update_xray --argjson p "$port" --arg u "$new_user" --arg pw "$new_pass" \
-            '(.inbounds[]? | select(.protocol=="socks" and .port==$p) | .settings.accounts[0]) |= {"user":$u,"pass":$pw}'
-          svc restart xray; green "修改成功"
-        else
-          red "输入无效或已取消"; pause
+
+        # 端口冲突检查：Xray 配置内是否已存在
+        ex="$(jq --argjson p "$p" '[.inbounds[]? | select(.port==$p)] | length' "$XRAY_CONF" 2>/dev/null || echo 0)"
+        if [ "${ex:-0}" -gt 0 ]; then
+          red "端口已存在于Xray配置"
+          pause
+          continue
         fi
+
+        update_xray --argjson p "$p" --arg u "$u" --arg pw "$pw" \
+          '.inbounds += [{
+            "tag":("socks-"+($p|tostring)),
+            "port":$p,
+            "listen":"0.0.0.0",
+            "protocol":"socks",
+            "settings":{"auth":"password","accounts":[{"user":$u,"pass":$pw}],"udp":true},
+            "sniffing":{"enabled":true,"destOverride":["http","tls"],"metadataOnly":false}
+          }]'
+
+        if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_socks_add_check.log 2>&1; then
+          red "配置校验失败，新增未生效"
+          tail -n 50 /tmp/xray_socks_add_check.log 2>/dev/null || true
+          pause
+          continue
+        fi
+
+        svc restart xray
+        green "添加成功"
+        pause
         ;;
+
+      2)
+        if [ -z "$list" ]; then
+          red "当前无可修改的Socks5配置"
+          pause
+          continue
+        fi
+
+        # 将每行对象读入数组，便于按序号选择
+        local -a rows=()
+        mapfile -t rows < <(printf '%s\n' "$list" | sed '/^$/d')
+
+        local idx
+        prompt "请输入要修改的序号(0取消): " idx
+        if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+          red "输入无效"
+          pause
+          continue
+        fi
+        [ "$idx" -eq 0 ] && continue
+        if [ "$idx" -lt 1 ] || [ "$idx" -gt "${#rows[@]}" ]; then
+          red "序号越界"
+          pause
+          continue
+        fi
+
+        local selected_line port user pass
+        selected_line="${rows[$((idx-1))]}"
+        port="$(echo "$selected_line" | jq -r '.port')"
+        user="$(echo "$selected_line" | jq -r '.settings.accounts[0].user')"
+        pass="$(echo "$selected_line" | jq -r '.settings.accounts[0].pass')"
+
+        green "当前配置 - 端口: $port, 用户名: $user"
+        local new_user new_pass
+        prompt "新用户名(留空保持不变): " new_user
+        prompt "新密码(留空保持不变): " new_pass
+        [ -z "$new_user" ] && new_user="$user"
+        [ -z "$new_pass" ] && new_pass="$pass"
+
+        update_xray --argjson p "$port" --arg u "$new_user" --arg pw "$new_pass" \
+          '(.inbounds[]? | select(.protocol=="socks" and .port==$p) | .settings.accounts[0]) |= {"user":$u,"pass":$pw}'
+
+        if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_socks_mod_check.log 2>&1; then
+          red "配置校验失败，修改未生效"
+          tail -n 50 /tmp/xray_socks_mod_check.log 2>/dev/null || true
+          pause
+          continue
+        fi
+
+        svc restart xray
+        green "修改成功"
+        pause
+        ;;
+
       3)
-        if [ -z "$list" ]; then red "无可删项"; pause; continue; fi
-        local i=1; declare -a ports=()
-        while read -r line; do
-          [ -z "$line" ] && continue
-          local p; p="$(echo "$line" | jq -r '.port')"
-          echo "  ${i}. 端口 ${p}"; ports[$i]="$p"; i=$((i+1))
-        done <<< "$list"
+        if [ -z "$list" ]; then
+          red "无可删项"
+          pause
+          continue
+        fi
+
+        local -a rows=() ports=()
+        mapfile -t rows < <(printf '%s\n' "$list" | sed '/^$/d')
+
+        local i=1
+        for line in "${rows[@]}"; do
+          local p u
+          p="$(echo "$line" | jq -r '.port')"
+          u="$(echo "$line" | jq -r '.settings.accounts[0].user')"
+          echo "  ${i}. 端口 ${p} | 用户 ${u}"
+          ports[$i]="$p"
+          i=$((i+1))
+        done
         echo "  0. 取消"
-        prompt "序号: " idx
-        if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -gt 0 ] && [ "$idx" -lt "$i" ]; then
-          update_xray --argjson p "${ports[$idx]}" 'del(.inbounds[]? | select(.protocol=="socks" and .port==$p))'
-          svc restart xray; green "已删除"
-        fi; pause ;;
+
+        local del_idx
+        prompt "序号: " del_idx
+        if ! [[ "$del_idx" =~ ^[0-9]+$ ]]; then
+          red "输入无效"
+          pause
+          continue
+        fi
+        [ "$del_idx" -eq 0 ] && continue
+        if [ "$del_idx" -lt 1 ] || [ "$del_idx" -ge "$i" ]; then
+          red "序号越界"
+          pause
+          continue
+        fi
+
+        update_xray --argjson p "${ports[$del_idx]}" \
+          'del(.inbounds[]? | select(.protocol=="socks" and .port==$p))'
+
+        if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_socks_del_check.log 2>&1; then
+          red "配置校验失败，删除未生效"
+          tail -n 50 /tmp/xray_socks_del_check.log 2>/dev/null || true
+          pause
+          continue
+        fi
+
+        svc restart xray
+        green "已删除"
+        pause
+        ;;
+
       0) return ;;
       *) red "无效"; pause ;;
     esac
@@ -1023,9 +1312,12 @@ setup_service_monitor(){
     red "服务 $svcname 未安装"; return 1
   fi
   yellow "开始设置服务监控（$svcname），每10分钟进行连通性检测"
+
   local monitor_script="${WORK}/monitor_argo.sh"
   local monitor_pid_file="${WORK}/monitor_argo.pid"
-  
+  local ready_url="http://127.0.0.1:2000/ready"
+  local metrics_url="http://127.0.0.1:2000/metrics"
+
   if [ -f "$monitor_pid_file" ]; then
     local old_pid; old_pid="$(cat "$monitor_pid_file" 2>/dev/null || true)"
     if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
@@ -1038,51 +1330,100 @@ setup_service_monitor(){
   cat > "$monitor_script" <<'MONITOR_SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
+
 SVCNAME="tunnel-argo"
 WORK="/etc/xray"
-PIDFILE="${WORK}/monitor_argo.pid"
 LOG="${WORK}/monitor_argo.log"
+
 CHECK_INTERVAL=600
 RETRY_INTERVAL=20
 MAX_RETRIES=3
 RESTART_DELAY=60
 WAIT_AFTER_FAILURE=600
-HEALTH_CHECK_CMD="cloudflared tunnel --url http://localhost:2000/healthcheck"
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 监控启动: $SVCNAME" >> "$LOG"
+READY_URL="http://127.0.0.1:2000/ready"
+METRICS_URL="http://127.0.0.1:2000/metrics"
+
+http_ok() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 4 "$url" >/dev/null 2>&1
+    return $?
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 4 -O /dev/null "$url" >/dev/null 2>&1
+    return $?
+  else
+    return 1
+  fi
+}
+
+metrics_valid() {
+  local body=""
+  if command -v curl >/dev/null 2>&1; then
+    body="$(curl -fsS --max-time 4 "$METRICS_URL" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    body="$(wget -q -T 4 -O - "$METRICS_URL" 2>/dev/null || true)"
+  fi
+  [ -n "$body" ] && echo "$body" | grep -qE '(^# HELP|cloudflared_)'
+}
+
+health_check() {
+  # 1) 优先 /ready
+  if http_ok "$READY_URL"; then
+    return 0
+  fi
+  # 2) 回退 /metrics
+  metrics_valid
+}
+
+restart_svc() {
+  if [ -f /etc/alpine-release ] && command -v rc-service >/dev/null 2>&1; then
+    rc-service "$SVCNAME" restart >/dev/null 2>&1 || true
+  else
+    systemctl restart "$SVCNAME" >/dev/null 2>&1 || true
+  fi
+}
+
+is_running_svc() {
+  if [ -f /etc/alpine-release ] && command -v rc-service >/dev/null 2>&1; then
+    rc-service "$SVCNAME" status 2>/dev/null | grep -q started
+  else
+    [ "$(systemctl is-active "$SVCNAME" 2>/dev/null)" = "active" ]
+  fi
+}
+
+echo "[$(date '+%F %T')] 监控启动: $SVCNAME" >> "$LOG"
 
 while true; do
-  local check_failed=0
+  check_failed=0
   for ((i=1; i<=MAX_RETRIES; i++)); do
-    # 使用官方健康检查命令
-    if $HEALTH_CHECK_CMD >/dev/null 2>&1; then
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 服务 $SVCNAME 健康检查通过 (第${i}次检查)" >> "$LOG"
+    if health_check; then
+      echo "[$(date '+%F %T')] 健康检查通过 (第${i}次，ready/metrics)" >> "$LOG"
       check_failed=0
       break
     else
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 服务 $SVCNAME 健康检查失败 (第${i}次检查)" >> "$LOG"
+      echo "[$(date '+%F %T')] 健康检查失败 (第${i}次，ready/metrics)" >> "$LOG"
       check_failed=1
-      if [ "$i" -lt "$MAX_RETRIES" ]; then
-        sleep "$RETRY_INTERVAL"
-      fi
+      [ "$i" -lt "$MAX_RETRIES" ] && sleep "$RETRY_INTERVAL"
     fi
   done
 
   if [ "$check_failed" -eq 1 ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 连续${MAX_RETRIES}次健康检查失败，重启服务..." >> "$LOG"
-    svc restart "$SVCNAME" || true
+    echo "[$(date '+%F %T')] 连续${MAX_RETRIES}次失败，重启服务..." >> "$LOG"
+    restart_svc
     sleep "$RESTART_DELAY"
-    if is_running "$SVCNAME"; then
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 重启后服务已运行" >> "$LOG"
+
+    if is_running_svc; then
+      echo "[$(date '+%F %T')] 重启后服务运行中" >> "$LOG"
     else
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 重启后服务仍未运行，等待${WAIT_AFTER_FAILURE}秒后再次尝试..." >> "$LOG"
+      echo "[$(date '+%F %T')] 重启后仍未运行，等待${WAIT_AFTER_FAILURE}秒后再试" >> "$LOG"
       sleep "$WAIT_AFTER_FAILURE"
-      svc restart "$SVCNAME" || true
+      restart_svc
       sleep 10
-      if is_running "$SVCNAME"; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 等待后重启成功" >> "$LOG"
+      if is_running_svc; then
+        echo "[$(date '+%F %T')] 二次重启成功" >> "$LOG"
       else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 等待后重启仍失败，等待下一轮监控周期" >> "$LOG"
+        echo "[$(date '+%F %T')] 二次重启仍失败，等待下一轮" >> "$LOG"
       fi
     fi
   fi
@@ -1094,9 +1435,10 @@ MONITOR_SCRIPT
   chmod +x "$monitor_script"
   nohup "$monitor_script" >/dev/null 2>&1 &
   echo $! > "$monitor_pid_file"
+
   green "服务监控已设置，监控日志: ${WORK}/monitor_argo.log"
   green "监控进程 PID: $(cat "$monitor_pid_file")"
-  green "健康检查使用命令: $HEALTH_CHECK_CMD"
+  green "健康检查: ${ready_url} (失败则回退 ${metrics_url})"
 }
 
 stop_service_monitor(){
@@ -1231,7 +1573,7 @@ full_uninstall(){
     (crontab -l 2>/dev/null | sed '/#svc-restart-all/d') | crontab - 2>/dev/null || true
   swap_disable_all >/dev/null 2>&1 || true
   rm -f /usr/local/bin/ssgo /usr/bin/ssgo
-  rm -rf "$WORK" "$SB"
+  rm -rf "$WORK"
   rm -rf /etc/ssgo
   green "已彻底卸载（服务/配置/快捷方式/监控/SWAP 已清理）"
 }
