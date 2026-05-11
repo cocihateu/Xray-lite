@@ -1093,7 +1093,7 @@ configure_hy2_add(){
     return 1
   fi
 
-  open_port "$port" udp
+  open_port "$port" udp || yellow "防火墙自动放行失败，请手动放行 ${port}/udp"
   hy2_add_list_entry "$tag" "$port" "$domain" "$auth" "$up" "$down" "$obfs" "$cert_mode_saved"
   svc restart xray
   green "HY2实例添加成功: 端口 ${port}"
@@ -1296,7 +1296,7 @@ configure_hy2_reinstall_port(){
     return 1
   fi
 
-  open_port "$new_port" udp
+  open_port "$new_port" udp || yellow "防火墙自动放行失败，请手动放行 ${new_port}/udp"
   hy2_update_list_entry_by_port "$old_port" "$new_tag" "$new_port" "$domain" "$auth" "$up" "$down" "$obfs" "$cert_mode"
   svc restart xray
   green "重装成功：${old_port} -> ${new_port}"
