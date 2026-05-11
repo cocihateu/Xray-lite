@@ -50,7 +50,7 @@ auto_hl(){
     printf "%b%s%b%b卸载%b%b%s%b" "$C_TXT" "$left" "$C_RST" "$C_BAD" "$C_RST" "$C_TXT" "$right" "$C_RST"
     return
   fi
-  for pre in 管理 安装 查看 修改 重启 设置 创建 实时 配置 启用 关闭 删除 添加 定时 彻底; do
+  for pre in 管理 安装 查看 修改 重启 设置 创建 实时 配置 启用 关闭 删除 添加 定时 彻底 更新; do
     if [[ "$s" == "$pre"* ]]; then
       kw="${s#$pre}"
       if [ -z "$kw" ]; then printf "%b%s%b" "$C_TXT" "$s" "$C_RST"; else
@@ -94,16 +94,28 @@ ARGO_JSON="${WORK}/tunnel_argo.json"
 RESTART_CONF="${WORK}/restart.conf"
 OUTBOUND_CONF="${WORK}/outbound_policy.conf"
 IPCACHE="${WORK}/ip_cache.conf"
+
+# 兼容旧单实例文件（可迁移）
 HY2_STATE="${WORK}/hy2_state.conf"
+# 新多实例列表
+HY2_LIST="${WORK}/hy2_list.json"
 
 SWAP_LOG="/tmp/swap.log"
+
+# 监控
+MONITOR_LOG="${WORK}/monitor_argo.log"
+MONITOR_DOWN_COUNT="${WORK}/monitor_argo_down.count"
 
 UUID_FALLBACK="$(cat /proc/sys/kernel/random/uuid)"
 CFIP=${CFIP:-'172.67.146.150'}
 SS_FIXED_IP="172.64.147.74"
 
+# XHTTP random padding header/key (<=6 alnum)
+XHTTP_PAD="$(tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 6)"
+[ -z "${XHTTP_PAD:-}" ] && XHTTP_PAD="y2k"
+
 XHTTP_MODE="auto"
-XHTTP_EXTRA_JSON='{"xPaddingObfsMode":true,"xPaddingMethod":"tokenish","xPaddingPlacement":"queryInHeader","xPaddingHeader":"y2k","xPaddingKey":"_y2k"}'
+XHTTP_EXTRA_JSON="{\"xPaddingObfsMode\":true,\"xPaddingMethod\":\"tokenish\",\"xPaddingPlacement\":\"queryInHeader\",\"xPaddingHeader\":\"${XHTTP_PAD}\",\"xPaddingKey\":\"_${XHTTP_PAD}\"}"
 
 HY2_SELF_SNI_DEFAULT="www.amd.com"
 
@@ -112,7 +124,7 @@ GH_SPEED_THRESHOLD_MBPS=20
 GH_SPEED_THRESHOLD_BPS=2500000
 GH_USE_FAST_MIRROR=0
 
-SCRIPT_URL_DEFAULT="https://raw.githubusercontent.com/KisThFir/Xray-ssgo/refs/heads/main/Xray_ssgo.sh"
+SCRIPT_URL_DEFAULT="https://raw.githubusercontent.com/cocihateu/Xray-lite/refs/heads/main/Xray_lite.sh"
 SCRIPT_URL="${SCRIPT_URL:-$SCRIPT_URL_DEFAULT}"
 
 YOUTUBE_MODE=1
@@ -163,6 +175,11 @@ ensure_deps(){
 }
 
 # ========== Helpers ==========
+rand_alnum(){
+  local n="${1:-6}"
+  tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c "$n"
+}
+
 detect_xray_arch(){
   case "$(uname -m)" in
     x86_64|amd64) echo "64" ;; aarch64|arm64) echo "arm64-v8a" ;; i?86) echo "32" ;; armv7l|armv7|armhf) echo "arm32-v7a" ;; armv6l|armv6) echo "arm32-v6" ;; s390x) echo "s390x" ;; riscv64) echo "riscv64" ;; *) echo "" ;;
@@ -247,13 +264,128 @@ ensure_acme(){
   }
 }
 
+detect_ssh_ports(){
+  # 输出多行端口号
+  {
+    echo 22
+    # 当前SSH会话端口（SSH_CONNECTION第4列是服务端端口）
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+      echo "$SSH_CONNECTION" | awk '{print $4}'
+    fi
+    # sshd_config 里的 Port
+    if [ -f /etc/ssh/sshd_config ]; then
+      awk '/^[[:space:]]*Port[[:space:]]+[0-9]+([[:space:]]|$)/{print $2}' /etc/ssh/sshd_config
+    fi
+  } | grep -E '^[0-9]+$' | awk '$1>=1 && $1<=65535' | sort -n | uniq
+}
+
+protect_ssh_ufw(){
+  local sp
+  while read -r sp; do
+    [ -n "$sp" ] || continue
+    ufw allow "${sp}/tcp" >/dev/null 2>&1 || true
+  done < <(detect_ssh_ports)
+}
+
+protect_ssh_firewalld(){
+  local sp
+  while read -r sp; do
+    [ -n "$sp" ] || continue
+    firewall-cmd --add-port="${sp}/tcp" --permanent >/dev/null 2>&1 || true
+  done < <(detect_ssh_ports)
+}
+
 open_port(){
   local p="$1" proto="${2:-tcp}"
-  command -v ufw >/dev/null 2>&1 && ufw allow "${p}/${proto}" >/dev/null 2>&1 || true
-  if command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --add-port="${p}/${proto}" --permanent >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
+
+  # 1) 已启用 UFW -> 用 UFW
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qi '^Status: active'; then
+      ufw allow "${p}/${proto}" >/dev/null 2>&1 && {
+        green "端口已放行(ufw): ${p}/${proto}"
+        return 0
+      }
+    fi
   fi
+
+  # 2) 已运行 firewalld -> 用 firewalld
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if firewall-cmd --state 2>/dev/null | grep -qi '^running$'; then
+      firewall-cmd --add-port="${p}/${proto}" --permanent >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      if firewall-cmd --list-ports 2>/dev/null | grep -Eq "(^|[[:space:]])${p}/${proto}([[:space:]]|$)"; then
+        green "端口已放行(firewalld): ${p}/${proto}"
+        return 0
+      fi
+    fi
+  fi
+
+  # 3) 都没启用时：可选自动启用 UFW（先保护 SSH）
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qi '^Status: inactive'; then
+      protect_ssh_ufw
+      ufw --force enable >/dev/null 2>&1 || true
+      ufw allow "${p}/${proto}" >/dev/null 2>&1 || true
+      if ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        green "已启用ufw并放行(含SSH保护): ${p}/${proto}"
+        return 0
+      fi
+    fi
+  fi
+
+  # 4) 都没启用时：可选自动启用 firewalld（先保护 SSH）
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    if ! firewall-cmd --state >/dev/null 2>&1; then
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now firewalld >/dev/null 2>&1 || true
+      elif command -v rc-service >/dev/null 2>&1; then
+        rc-service firewalld start >/dev/null 2>&1 || true
+        rc-update add firewalld default >/dev/null 2>&1 || true
+      fi
+    fi
+    if firewall-cmd --state 2>/dev/null | grep -qi '^running$'; then
+      protect_ssh_firewalld
+      firewall-cmd --add-port="${p}/${proto}" --permanent >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      if firewall-cmd --list-ports 2>/dev/null | grep -Eq "(^|[[:space:]])${p}/${proto}([[:space:]]|$)"; then
+        green "已启用firewalld并放行(含SSH保护): ${p}/${proto}"
+        return 0
+      fi
+    fi
+  fi
+
+  # 5) fallback：nftables 优先
+  if command -v nft >/dev/null 2>&1; then
+    if nft list chain inet filter input >/dev/null 2>&1; then
+      nft list chain inet filter input 2>/dev/null | grep -Eq "\\b${proto}\\s+dport\\s+${p}\\b.*\\baccept\\b" || \
+        nft add rule inet filter input ${proto} dport "${p}" accept >/dev/null 2>&1 || true
+
+      if nft list chain inet filter input 2>/dev/null | grep -Eq "\\b${proto}\\s+dport\\s+${p}\\b.*\\baccept\\b"; then
+        green "端口已放行(nftables): ${p}/${proto}"
+        return 0
+      fi
+    fi
+  fi
+
+  # 6) fallback：iptables
+  if command -v iptables >/dev/null 2>&1; then
+    local ok4=1 ok6=1
+    iptables -C INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 || \
+      iptables -I INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 || ok4=0
+
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -C INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 || \
+        ip6tables -I INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 || ok6=0
+    fi
+
+    if [ "$ok4" -eq 1 ] || [ "$ok6" -eq 1 ]; then
+      green "端口已放行(iptables): ${p}/${proto}"
+      return 0
+    fi
+  fi
+
+  yellow "放行失败，请手动放行（并确认SSH端口已开放）: ${p}/${proto}"
+  return 1
 }
 
 # ========== State ==========
@@ -489,7 +621,53 @@ EOF
   svc restart xray; green "Xray 安装完成"
 }
 
-# ========== Outbound apply (Revised) ==========
+update_xray_core(){
+  ensure_deps || return 1
+  mkdir -p "$WORK"
+  local arch url
+  arch="$(detect_xray_arch)"; [ -z "$arch" ] && { red "架构不支持Xray"; return 1; }
+  url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip"
+  smart_download "${WORK}/xray_update.zip" "$url" 5000000 || { red "下载Xray失败"; return 1; }
+  unzip -o "${WORK}/xray_update.zip" -d "${WORK}/" >/dev/null 2>&1 || { red "解压失败"; return 1; }
+  chmod +x "$XRAY_BIN"
+  rm -f "${WORK}/xray_update.zip" "${WORK}/README.md" "${WORK}/LICENSE"
+  if [ -f "$XRAY_CONF" ] && ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_update_check.log 2>&1; then
+    red "更新后配置校验失败"
+    tail -n 60 /tmp/xray_update_check.log 2>/dev/null || true
+    return 1
+  fi
+  svc restart xray
+  green "Xray 更新完成"
+}
+
+uninstall_xray_only(){
+  cls
+  echo -e "${C_WARN}=========== 卸载 Xray ===========${C_RST}"
+  echo "1) 卸载程序与服务（保留配置）"
+  echo "2) 完全卸载（程序/服务/配置）"
+  echo "0) 取消"
+  prompt "请选择: " m
+  case "$m" in
+    1)
+      svc stop xray; svc disable xray
+      rm -f /etc/init.d/xray /etc/systemd/system/xray.service "$XRAY_BIN"
+      command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+      green "Xray已卸载（配置保留）"
+      ;;
+    2)
+      svc stop xray; svc disable xray
+      rm -f /etc/init.d/xray /etc/systemd/system/xray.service
+      rm -f "$XRAY_BIN" "$XRAY_CONF" "$HY2_STATE" "$HY2_LIST"
+      command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+      green "Xray已完全卸载"
+      ;;
+    *)
+      yellow "已取消"
+      ;;
+  esac
+}
+
+# ========== Outbound apply ==========
 apply_policy_xray(){
   [ -f "$XRAY_CONF" ] || return 0; ensure_dns_rule
   update_xray '
@@ -650,20 +828,53 @@ uninstall_argo(){
   green "Argo 已卸载"
 }
 
-# ========== HY2 ==========
-write_hy2_state(){
-  local port="$1" domain="$2" pass="$3" up="$4" down="$5" obfs="$6" cert_mode="$7"
+# ========== HY2 multi ==========
+init_hy2_list(){
   mkdir -p "$WORK"
-  cat > "$HY2_STATE" <<EOF
-PORT=$port
-DOMAIN=$domain
-PASS=$pass
-UP=$up
-DOWN=$down
-OBFS=$obfs
-CERT_MODE=$cert_mode
-EOF
+  [ -f "$HY2_LIST" ] || echo '[]' > "$HY2_LIST"
 }
+migrate_old_hy2_state(){
+  [ -f "$HY2_STATE" ] || return 0
+  init_hy2_list
+  local has
+  has="$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)"
+  if [ "${has:-0}" -gt 0 ]; then
+    return 0
+  fi
+  # 迁移旧单实例
+  . "$HY2_STATE" 2>/dev/null || true
+  if [ -n "${PORT:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${PASS:-}" ]; then
+    local up down obfs cert_mode tag
+    up="${UP:-50}"; down="${DOWN:-250}"; obfs="${OBFS:-}"; cert_mode="${CERT_MODE:-cf}"
+    tag="hy2-${PORT}"
+    jq --arg tag "$tag" --argjson port "$PORT" --arg domain "$DOMAIN" --arg auth "$PASS" \
+       --argjson up "$up" --argjson down "$down" --arg obfs "$obfs" --arg cert_mode "$cert_mode" \
+       '. += [{"tag":$tag,"port":$port,"domain":$domain,"auth":$auth,"up":$up,"down":$down,"obfs":$obfs,"cert_mode":$cert_mode}]' \
+       "$HY2_LIST" > "${HY2_LIST}.tmp" && mv "${HY2_LIST}.tmp" "$HY2_LIST"
+    green "已将旧HY2单实例迁移到多实例列表"
+  fi
+}
+hy2_port_exists_in_conf(){
+  local p="$1"
+  jq --argjson p "$p" '[.inbounds[]? | select((.protocol=="hysteria" or .protocol=="hysteria2") and .port==$p)] | length' "$XRAY_CONF" 2>/dev/null | grep -qv '^0$'
+}
+hy2_random_free_port(){
+  local old="${1:-0}" p
+  while true; do
+    # 20000-65000（含）
+    p=$(( RANDOM % (65000 - 20000 + 1) + 20000 ))
+    [ "$old" -gt 0 ] && [ "$p" -eq "$old" ] && continue
+    if ss -tuln 2>/dev/null | grep -q ":${p} "; then
+      continue
+    fi
+    if hy2_port_exists_in_conf "$p"; then
+      continue
+    fi
+    echo "$p"
+    return
+  done
+}
+
 issue_cert_cf(){
   local d="$1" token="$2" cert_dir="${3:-$TLS_DIR_HY2}"
   local crt="${cert_dir}/${d}.crt" key="${cert_dir}/${d}.key"
@@ -695,7 +906,6 @@ issue_cert_selfsigned(){
       yellow "自签证书即将过期或已过期，重新生成: $d"
     fi
   fi
-  
   openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3650 \
     -subj "/CN=${d}" \
     -keyout "$key" -out "$crt" >/tmp/selfsign_issue.log 2>&1 || {
@@ -706,11 +916,119 @@ issue_cert_selfsigned(){
   [ -s "$crt" ] && [ -s "$key" ] || { red "自签证书文件异常"; return 1; }
   green "自签证书生成成功: $d"
 }
-install_hy2(){
-  install_xray || return 1; ensure_dns_rule || return 1
-  local mode cert_mode domain token port auth obfs prof up down cert_file key_file cert_mode_saved
-  prompt "HY2模式(1=一键最简 2=自定义，默认1): " mode
-  [ -z "${mode:-}" ] && mode=1; [[ "$mode" =~ ^[12]$ ]] || mode=1
+hy2_build_inbound_json(){
+  local tag="$1" port="$2" auth="$3" domain="$4" cert_file="$5" key_file="$6" obfs="$7"
+  if [ -n "$obfs" ]; then
+    jq -nc \
+      --arg tag "$tag" \
+      --argjson p "$port" \
+      --arg auth "$auth" \
+      --arg obfs "$obfs" \
+      --arg domain "$domain" \
+      --arg crt "$cert_file" \
+      --arg key "$key_file" \
+'{
+  "tag":$tag,
+  "listen":"::",
+  "port":$p,
+  "protocol":"hysteria",
+  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
+  "streamSettings":{
+    "network":"hysteria",
+    "security":"tls",
+    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
+    "hysteriaSettings":{"version":2},
+    "finalmask":{
+      "udp":[{"type":"salamander","settings":{"password":$obfs}}],
+      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
+    }
+  },
+  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+}'
+  else
+    jq -nc \
+      --arg tag "$tag" \
+      --argjson p "$port" \
+      --arg auth "$auth" \
+      --arg domain "$domain" \
+      --arg crt "$cert_file" \
+      --arg key "$key_file" \
+'{
+  "tag":$tag,
+  "listen":"::",
+  "port":$p,
+  "protocol":"hysteria",
+  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
+  "streamSettings":{
+    "network":"hysteria",
+    "security":"tls",
+    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
+    "hysteriaSettings":{"version":2},
+    "finalmask":{
+      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
+    }
+  },
+  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+}'
+  fi
+}
+hy2_add_list_entry(){
+  local tag="$1" port="$2" domain="$3" auth="$4" up="$5" down="$6" obfs="$7" cert_mode="$8"
+  init_hy2_list
+  jq --arg tag "$tag" --argjson port "$port" --arg domain "$domain" --arg auth "$auth" \
+     --argjson up "$up" --argjson down "$down" --arg obfs "$obfs" --arg cert_mode "$cert_mode" \
+     '. += [{"tag":$tag,"port":$port,"domain":$domain,"auth":$auth,"up":$up,"down":$down,"obfs":$obfs,"cert_mode":$cert_mode}]' \
+     "$HY2_LIST" > "${HY2_LIST}.tmp" && mv "${HY2_LIST}.tmp" "$HY2_LIST"
+}
+hy2_update_list_entry_by_port(){
+  local old_port="$1" new_tag="$2" new_port="$3" domain="$4" auth="$5" up="$6" down="$7" obfs="$8" cert_mode="$9"
+  jq --argjson oldp "$old_port" --arg tag "$new_tag" --argjson p "$new_port" --arg domain "$domain" --arg auth "$auth" \
+     --argjson up "$up" --argjson down "$down" --arg obfs "$obfs" --arg cert_mode "$cert_mode" \
+     'map(if .port==$oldp then .tag=$tag | .port=$p | .domain=$domain | .auth=$auth | .up=$up | .down=$down | .obfs=$obfs | .cert_mode=$cert_mode else . end)' \
+     "$HY2_LIST" > "${HY2_LIST}.tmp" && mv "${HY2_LIST}.tmp" "$HY2_LIST"
+}
+hy2_del_by_port(){
+  local p="$1"
+  update_xray --argjson p "$p" 'del(.inbounds[]? | select((.protocol=="hysteria" or .protocol=="hysteria2") and .port==$p))'
+  init_hy2_list
+  jq --argjson p "$p" 'map(select(.port != $p))' "$HY2_LIST" > "${HY2_LIST}.tmp" && mv "${HY2_LIST}.tmp" "$HY2_LIST"
+}
+hy2_list_show_table(){
+  init_hy2_list
+  local list
+  list="$(jq -c '.[]' "$HY2_LIST" 2>/dev/null || true)"
+  if [ -z "$list" ]; then
+    echo -e "当前: ${C_BAD}未配置${C_RST}"
+    return
+  fi
+  echo "-----------------------------------------------------------------------"
+  echo " 序号 | 端口   | 域名                  | 认证(auth) | 证书 | 混淆 | 带宽"
+  echo "-----------------------------------------------------------------------"
+  local i=1
+  while IFS= read -r one; do
+    [ -z "$one" ] && continue
+    local p d a cm ob up down
+    p="$(echo "$one" | jq -r '.port')"
+    d="$(echo "$one" | jq -r '.domain')"
+    a="$(echo "$one" | jq -r '.auth')"
+    cm="$(echo "$one" | jq -r '.cert_mode')"
+    ob="$(echo "$one" | jq -r '.obfs')"
+    up="$(echo "$one" | jq -r '.up')"
+    down="$(echo "$one" | jq -r '.down')"
+    [ -z "$ob" ] && ob="-"
+    printf " %-4s| %-7s| %-22s| %-11s| %-4s| %-4s| %s/%s\n" "$i" "$p" "$d" "${a:0:11}" "$cm" "$ob" "$up" "$down"
+    i=$((i+1))
+  done <<< "$list"
+}
+hy2_pick_by_index(){
+  local idx="$1"
+  init_hy2_list
+  jq -c ".[$((idx-1))] // empty" "$HY2_LIST" 2>/dev/null || true
+}
+
+configure_hy2_add(){
+  install_xray || return 1; ensure_dns_rule || return 1; init_hy2_list
+  local cert_mode domain token port auth obfs prof up down cert_mode_saved cert_file key_file tag
   prompt "证书模式(1=本机自签 2=CF令牌签发，默认1): " cert_mode
   [ -z "${cert_mode:-}" ] && cert_mode=1; [[ "$cert_mode" =~ ^[12]$ ]] || cert_mode=1
   if [ "$cert_mode" = "1" ]; then
@@ -725,195 +1043,215 @@ install_hy2(){
     cert_mode_saved="cf"
   fi
   cert_file="${TLS_DIR_HY2}/${domain}.crt"; key_file="${TLS_DIR_HY2}/${domain}.key"
-  prompt "HY2端口(默认38167): " port; [ -z "$port" ] && port=38167; [[ "$port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+
+  prompt "HY2端口(回车随机): " port
+  if [ -z "$port" ]; then
+    port="$(hy2_random_free_port 0)"
+  else
+    [[ "$port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { red "端口越界"; return 1; }
+    if hy2_port_exists_in_conf "$port"; then red "端口已被HY2占用"; return 1; fi
+    if ss -tuln 2>/dev/null | grep -q ":${port} "; then yellow "警告：系统检测该端口可能被占用"; fi
+  fi
+
   prompt "HY2认证AUTH(回车随机UUID): " auth; [ -z "$auth" ] && auth="$(gen_uuid)"
-  obfs=""; up=50; down=250
-  if [ "$mode" = "2" ]; then
-    prompt "HY2混淆密码OBFS(回车随机UUID): " obfs; [ -z "$obfs" ] && obfs="$(gen_uuid)"
-    echo "带宽档位: 1.默认(50/250 Mbps) 2.自定义"
-    prompt "选择(默认1): " prof
-    case "$prof" in
-      2) prompt "上行Mbps(默认50): " up; prompt "下行Mbps(默认250): " down; [ -z "$up" ] && up=50; [ -z "$down" ] && down=250; [[ "$up" =~ ^[0-9]+$ ]] || up=50; [[ "$down" =~ ^[0-9]+$ ]] || down=250 ;;
-      *) up=50; down=250 ;;
-    esac
-  else
-    yellow "一键最简模式：无混淆、默认50/250 Mbps（客户端可改）"
-  fi
-  open_port "$port" udp
-  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or .protocol=="hysteria" or .protocol=="hysteria2"))'
-  local hy2
-  if [ -n "$obfs" ]; then
-    hy2="$(jq -nc \
-      --argjson p "$port" \
-      --arg auth "$auth" \
-      --arg obfs "$obfs" \
-      --arg domain "$domain" \
-      --arg crt "$cert_file" \
-      --arg key "$key_file" \
-'{
-  "tag":"hy2-in",
-  "listen":"::",
-  "port":$p,
-  "protocol":"hysteria",
-  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
-  "streamSettings":{
-    "network":"hysteria",
-    "security":"tls",
-    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
-    "hysteriaSettings":{"version":2},
-    "finalmask":{
-      "udp":[{"type":"salamander","settings":{"password":$obfs}}],
-      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
-    }
-  },
-  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
-}')"
-  else
-    hy2="$(jq -nc \
-      --argjson p "$port" \
-      --arg auth "$auth" \
-      --arg domain "$domain" \
-      --arg crt "$cert_file" \
-      --arg key "$key_file" \
-'{
-  "tag":"hy2-in",
-  "listen":"::",
-  "port":$p,
-  "protocol":"hysteria",
-  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
-  "streamSettings":{
-    "network":"hysteria",
-    "security":"tls",
-    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
-    "hysteriaSettings":{"version":2},
-    "finalmask":{
-      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
-    }
-  },
-  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
-}')"
-  fi
-  update_xray --argjson ib "$hy2" '.inbounds += [$ib]'
-  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_hy2_check.log 2>&1; then
-    red "Xray 配置校验失败"; tail -n 80 /tmp/xray_hy2_check.log 2>/dev/null || true; return 1
-  fi
-  svc restart xray
-  write_hy2_state "$port" "$domain" "$auth" "$up" "$down" "$obfs" "$cert_mode_saved"
-  ask_enable_youtube_strict
-  green "HY2 安装成功（Xray）"
-  if [ "$cert_mode_saved" = "self" ]; then green "证书模式：本机自签（客户端默认 insecure=1）"; else green "证书模式：CF令牌签发（客户端默认 insecure=0）"; fi
-  if [ "$mode" = "1" ]; then green "当前为一键最简：无混淆 / 默认50/250 Mbps"; else green "当前为自定义：UP=${up}Mbps DOWN=${down}Mbps"; fi
-}
-reinstall_hy2(){
-  [ -f "$HY2_STATE" ] || { red "HY2 未安装，无需重装"; return; }
+  prompt "HY2混淆密码OBFS(回车留空=不启用混淆): " obfs
 
-  # 读取旧状态
-  local OLD_PORT OLD_DOMAIN OLD_PASS OLD_UP OLD_DOWN OLD_OBFS OLD_CERT_MODE
-  OLD_PORT="$(awk -F= '/^PORT=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
-  OLD_DOMAIN="$(awk -F= '/^DOMAIN=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
-  OLD_PASS="$(awk -F= '/^PASS=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
-  OLD_UP="$(awk -F= '/^UP=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
-  OLD_DOWN="$(awk -F= '/^DOWN=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
-  OLD_OBFS="$(awk -F= '/^OBFS=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
-  OLD_CERT_MODE="$(awk -F= '/^CERT_MODE=/{print $2}' "$HY2_STATE" 2>/dev/null || true)"
-
-  [ -z "$OLD_UP" ] && OLD_UP=50
-  [ -z "$OLD_DOWN" ] && OLD_DOWN=250
-  [[ "$OLD_UP" =~ ^[0-9]+$ ]] || OLD_UP=50
-  [[ "$OLD_DOWN" =~ ^[0-9]+$ ]] || OLD_DOWN=250
-  [ -z "$OLD_CERT_MODE" ] && OLD_CERT_MODE="cf"
-
-  cls
-  echo -e "${C_WARN}=============== HY2 重装模式 ===============${C_RST}"
-  echo "1) 继承旧配置（默认，仅更换端口）"
-  echo "2) 全新重装（可改证书/认证/混淆/带宽）"
-  echo "0) 取消"
-  echo "============================================"
-  local mode
-  prompt "请选择(默认1): " mode
-  [ -z "$mode" ] && mode=1
-
-  case "$mode" in
-    0) return ;;
-    1|2) ;;
-    *) red "输入无效"; return ;;
+  echo "带宽档位: 1.默认(50/250 Mbps) 2.自定义"
+  prompt "选择(默认1): " prof
+  case "$prof" in
+    2)
+      prompt "上行Mbps(默认50): " up
+      prompt "下行Mbps(默认250): " down
+      [ -z "$up" ] && up=50; [ -z "$down" ] && down=250
+      [[ "$up" =~ ^[0-9]+$ ]] || up=50
+      [[ "$down" =~ ^[0-9]+$ ]] || down=250
+      ;;
+    *)
+      up=50; down=250
+      ;;
   esac
 
-  # 先删旧 HY2 入站
-  svc stop xray || true
-  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or .protocol=="hysteria" or .protocol=="hysteria2"))'
+  tag="hy2-${port}"
+  local ib
+  ib="$(hy2_build_inbound_json "$tag" "$port" "$auth" "$domain" "$cert_file" "$key_file" "$obfs")"
+  update_xray --argjson ib "$ib" '.inbounds += [$ib]'
 
-  # 生成新端口（尽量避开旧端口和占用端口）
-  local new_port
-  while true; do
-    new_port=$(( RANDOM % 65535 + 1 ))
-    [[ "$new_port" -lt 1024 ]] && continue
-    [ -n "$OLD_PORT" ] && [[ "$new_port" -eq "$OLD_PORT" ]] && continue
-    if ! ss -tuln | grep -q ":${new_port} "; then
-      break
-    fi
-  done
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_hy2_add_check.log 2>&1; then
+    red "Xray 配置校验失败"
+    tail -n 80 /tmp/xray_hy2_add_check.log 2>/dev/null || true
+    update_xray --argjson p "$port" 'del(.inbounds[]? | select((.protocol=="hysteria" or .protocol=="hysteria2") and .port==$p))'
+    return 1
+  fi
 
-  install_xray || return 1
-  ensure_dns_rule || return 1
+  open_port "$port" udp
+  hy2_add_list_entry "$tag" "$port" "$domain" "$auth" "$up" "$down" "$obfs" "$cert_mode_saved"
+  svc restart xray
+  green "HY2实例添加成功: 端口 ${port}"
+}
 
-  local domain auth port obfs up down cert_mode_saved cert_file key_file token cert_mode
+configure_hy2_edit(){
+  init_hy2_list
+  local cnt; cnt="$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)"
+  [ "${cnt:-0}" -gt 0 ] || { red "无可修改实例"; return 1; }
 
-  if [ "$mode" = "1" ]; then
-    # 继承模式：仅换端口
-    domain="$OLD_DOMAIN"
-    auth="$OLD_PASS"
-    obfs="$OLD_OBFS"
-    up="$OLD_UP"
-    down="$OLD_DOWN"
-    cert_mode_saved="$OLD_CERT_MODE"
-    port="$new_port"
+  hy2_list_show_table
+  local idx
+  prompt "选择序号(0取消): " idx
+  [[ "$idx" =~ ^[0-9]+$ ]] || { red "输入无效"; return 1; }
+  [ "$idx" -eq 0 ] && return 0
+  [ "$idx" -ge 1 ] && [ "$idx" -le "$cnt" ] || { red "序号越界"; return 1; }
 
-    # 必要兜底
-    [ -z "$domain" ] && domain="$HY2_SELF_SNI_DEFAULT"
-    [ -z "$auth" ] && auth="$(gen_uuid)"
-    [[ "$up" =~ ^[0-9]+$ ]] || up=50
-    [[ "$down" =~ ^[0-9]+$ ]] || down=250
+  local one old_port old_domain old_auth old_up old_down old_obfs old_cert_mode
+  one="$(hy2_pick_by_index "$idx")"
+  [ -n "$one" ] || { red "读取失败"; return 1; }
 
-    cert_file="${TLS_DIR_HY2}/${domain}.crt"
-    key_file="${TLS_DIR_HY2}/${domain}.key"
+  old_port="$(echo "$one" | jq -r '.port')"
+  old_domain="$(echo "$one" | jq -r '.domain')"
+  old_auth="$(echo "$one" | jq -r '.auth')"
+  old_up="$(echo "$one" | jq -r '.up')"
+  old_down="$(echo "$one" | jq -r '.down')"
+  old_obfs="$(echo "$one" | jq -r '.obfs')"
+  old_cert_mode="$(echo "$one" | jq -r '.cert_mode')"
 
-    # 继承模式下仅复用已有证书；缺失则提示走全新重装
-    if [ ! -s "$cert_file" ] || [ ! -s "$key_file" ]; then
-      red "继承模式失败：找不到旧证书文件"
-      yellow "请改用“全新重装”模式重新签发证书"
-      return 1
-    fi
+  local new_auth new_obfs new_up new_down
+  green "当前: 端口=$old_port 域名=$old_domain 证书=$old_cert_mode"
+  prompt "新AUTH(留空不变): " new_auth
+  prompt "新OBFS(留空=不变，输入 none=清空): " new_obfs
+  prompt "新上行Mbps(留空不变): " new_up
+  prompt "新下行Mbps(留空不变): " new_down
 
-    green "继承模式：仅端口变更"
-    green "旧端口: ${OLD_PORT:-unknown} -> 新端口: ${port}"
-  else
-    # 全新重装：可改高级参数
-    prompt "证书模式(1=本机自签 2=CF令牌签发，默认1): " cert_mode
-    [ -z "${cert_mode:-}" ] && cert_mode=1
-    [[ "$cert_mode" =~ ^[12]$ ]] || cert_mode=1
+  [ -z "$new_auth" ] && new_auth="$old_auth"
+  if [ "$new_obfs" = "none" ]; then new_obfs=""
+  elif [ -z "$new_obfs" ]; then new_obfs="$old_obfs"
+  fi
+  [ -z "$new_up" ] && new_up="$old_up"
+  [ -z "$new_down" ] && new_down="$old_down"
+  [[ "$new_up" =~ ^[0-9]+$ ]] || new_up=50
+  [[ "$new_down" =~ ^[0-9]+$ ]] || new_down=250
 
-    if [ "$cert_mode" = "1" ]; then
+  local cert_file key_file tag ib
+  cert_file="${TLS_DIR_HY2}/${old_domain}.crt"
+  key_file="${TLS_DIR_HY2}/${old_domain}.key"
+  [ -s "$cert_file" ] && [ -s "$key_file" ] || { red "证书文件缺失，无法修改"; return 1; }
+
+  tag="hy2-${old_port}"
+  ib="$(hy2_build_inbound_json "$tag" "$old_port" "$new_auth" "$old_domain" "$cert_file" "$key_file" "$new_obfs")"
+
+  update_xray --argjson p "$old_port" 'del(.inbounds[]? | select((.protocol=="hysteria" or .protocol=="hysteria2") and .port==$p))'
+  update_xray --argjson ib "$ib" '.inbounds += [$ib]'
+
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_hy2_edit_check.log 2>&1; then
+    red "配置校验失败，修改未生效"
+    tail -n 80 /tmp/xray_hy2_edit_check.log 2>/dev/null || true
+    return 1
+  fi
+
+  hy2_update_list_entry_by_port "$old_port" "$tag" "$old_port" "$old_domain" "$new_auth" "$new_up" "$new_down" "$new_obfs" "$old_cert_mode"
+  svc restart xray
+  green "HY2实例修改成功"
+}
+
+configure_hy2_delete(){
+  init_hy2_list
+  local cnt; cnt="$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)"
+  [ "${cnt:-0}" -gt 0 ] || { red "无可删除实例"; return 1; }
+  hy2_list_show_table
+  local idx
+  prompt "选择序号删除(0取消): " idx
+  [[ "$idx" =~ ^[0-9]+$ ]] || { red "输入无效"; return 1; }
+  [ "$idx" -eq 0 ] && return 0
+  [ "$idx" -ge 1 ] && [ "$idx" -le "$cnt" ] || { red "序号越界"; return 1; }
+
+  local one p
+  one="$(hy2_pick_by_index "$idx")"
+  p="$(echo "$one" | jq -r '.port')"
+  [ -n "$p" ] || { red "读取端口失败"; return 1; }
+
+  hy2_del_by_port "$p"
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_hy2_del_check.log 2>&1; then
+    red "配置校验失败，删除可能未生效"
+    tail -n 60 /tmp/xray_hy2_del_check.log 2>/dev/null || true
+    return 1
+  fi
+  svc restart xray
+  green "已删除HY2实例: 端口 $p"
+}
+
+configure_hy2_reinstall_port(){
+  init_hy2_list
+  local cnt; cnt="$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)"
+  [ "${cnt:-0}" -gt 0 ] || { red "无可重装实例"; return 1; }
+
+  hy2_list_show_table
+  local idx
+  prompt "选择要重装换端口的序号(0取消): " idx
+  [[ "$idx" =~ ^[0-9]+$ ]] || { red "输入无效"; return 1; }
+  [ "$idx" -eq 0 ] && return 0
+  [ "$idx" -ge 1 ] && [ "$idx" -le "$cnt" ] || { red "序号越界"; return 1; }
+
+  local one old_port domain auth up down obfs cert_mode
+  one="$(hy2_pick_by_index "$idx")"
+  old_port="$(echo "$one" | jq -r '.port')"
+  domain="$(echo "$one" | jq -r '.domain')"
+  auth="$(echo "$one" | jq -r '.auth')"
+  up="$(echo "$one" | jq -r '.up')"
+  down="$(echo "$one" | jq -r '.down')"
+  obfs="$(echo "$one" | jq -r '.obfs')"
+  cert_mode="$(echo "$one" | jq -r '.cert_mode')"
+
+  cls
+  echo -e "${C_WARN}========== HY2端口重装模式 ==========${C_RST}"
+  echo "1) 继承模式（仅换端口）"
+  echo "2) 追加UUID（换端口+重置AUTH随机UUID）"
+  echo "3) 全新安装（换端口+可改证书/域名/AUTH/OBFS/带宽）"
+  echo "0) 取消"
+  prompt "请选择: " mode
+  case "$mode" in
+    0) return 0 ;;
+    1|2|3) ;;
+    *) red "无效"; return 1 ;;
+  esac
+
+  local new_port pm
+  echo "新端口方式: 1.随机 2.手动指定"
+  prompt "选择(默认1): " pm
+  [ -z "$pm" ] && pm=1
+  case "$pm" in
+    2)
+      prompt "输入新端口(1-65535): " new_port
+      [[ "$new_port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+      [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ] || { red "端口越界"; return 1; }
+      [ "$new_port" -ne "$old_port" ] || { red "新端口不能与旧端口相同"; return 1; }
+      if hy2_port_exists_in_conf "$new_port"; then red "端口已被HY2占用"; return 1; fi
+      ;;
+    *)
+      new_port="$(hy2_random_free_port "$old_port")"
+      ;;
+  esac
+
+  local cert_file key_file token cert_mode_in
+  if [ "$mode" = "2" ]; then
+    auth="$(gen_uuid)"
+  elif [ "$mode" = "3" ]; then
+    prompt "证书模式(1=本机自签 2=CF令牌签发，默认1): " cert_mode_in
+    [ -z "${cert_mode_in:-}" ] && cert_mode_in=1
+    [[ "$cert_mode_in" =~ ^[12]$ ]] || cert_mode_in=1
+
+    if [ "$cert_mode_in" = "1" ]; then
       prompt "HY2伪装域名(回车默认 ${HY2_SELF_SNI_DEFAULT}): " domain
       [ -z "$domain" ] && domain="$HY2_SELF_SNI_DEFAULT"
       issue_cert_selfsigned "$domain" "$TLS_DIR_HY2" || return 1
-      cert_mode_saved="self"
+      cert_mode="self"
     else
       prompt "HY2域名: " domain; [ -z "$domain" ] && { red "域名不能为空"; return 1; }
       prompt "Cloudflare API Token: " token; [ -z "$token" ] && { red "Token不能为空"; return 1; }
       issue_cert_cf "$domain" "$token" "$TLS_DIR_HY2" || return 1
-      cert_mode_saved="cf"
+      cert_mode="cf"
     fi
-
-    cert_file="${TLS_DIR_HY2}/${domain}.crt"
-    key_file="${TLS_DIR_HY2}/${domain}.key"
-
-    port="$new_port"
     prompt "HY2认证AUTH(回车随机UUID): " auth
     [ -z "$auth" ] && auth="$(gen_uuid)"
-
-    prompt "HY2混淆密码OBFS(回车留空=不启用混淆): " obfs
-
+    prompt "HY2混淆密码OBFS(回车留空=不启用): " obfs
     local prof
     echo "带宽档位: 1.默认(50/250 Mbps) 2.自定义"
     prompt "选择(默认1): " prof
@@ -927,70 +1265,21 @@ reinstall_hy2(){
         [[ "$down" =~ ^[0-9]+$ ]] || down=250
         ;;
       *)
-        up=50
-        down=250
-        ;;
+        up=50; down=250 ;;
     esac
-
-    green "全新重装：旧端口 ${OLD_PORT:-unknown} -> 新端口 ${port}"
   fi
 
-  open_port "$port" udp
+  cert_file="${TLS_DIR_HY2}/${domain}.crt"
+  key_file="${TLS_DIR_HY2}/${domain}.key"
+  [ -s "$cert_file" ] && [ -s "$key_file" ] || { red "证书文件不存在: $domain"; return 1; }
 
-  local hy2
-  if [ -n "$obfs" ]; then
-    hy2="$(jq -nc \
-      --argjson p "$port" \
-      --arg auth "$auth" \
-      --arg obfs "$obfs" \
-      --arg domain "$domain" \
-      --arg crt "$cert_file" \
-      --arg key "$key_file" \
-'{
-  "tag":"hy2-in",
-  "listen":"::",
-  "port":$p,
-  "protocol":"hysteria",
-  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
-  "streamSettings":{
-    "network":"hysteria",
-    "security":"tls",
-    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
-    "hysteriaSettings":{"version":2},
-    "finalmask":{
-      "udp":[{"type":"salamander","settings":{"password":$obfs}}],
-      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
-    }
-  },
-  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
-}')"
-  else
-    hy2="$(jq -nc \
-      --argjson p "$port" \
-      --arg auth "$auth" \
-      --arg domain "$domain" \
-      --arg crt "$cert_file" \
-      --arg key "$key_file" \
-'{
-  "tag":"hy2-in",
-  "listen":"::",
-  "port":$p,
-  "protocol":"hysteria",
-  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
-  "streamSettings":{
-    "network":"hysteria",
-    "security":"tls",
-    "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
-    "hysteriaSettings":{"version":2},
-    "finalmask":{
-      "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
-    }
-  },
-  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
-}')"
-  fi
+  local new_tag ib
+  new_tag="hy2-${new_port}"
+  ib="$(hy2_build_inbound_json "$new_tag" "$new_port" "$auth" "$domain" "$cert_file" "$key_file" "$obfs")"
 
-  update_xray --argjson ib "$hy2" '.inbounds += [$ib]'
+  # 删除旧，追加新
+  update_xray --argjson p "$old_port" 'del(.inbounds[]? | select((.protocol=="hysteria" or .protocol=="hysteria2") and .port==$p))'
+  update_xray --argjson ib "$ib" '.inbounds += [$ib]'
 
   if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_hy2_reinstall_check.log 2>&1; then
     red "Xray 配置校验失败"
@@ -998,22 +1287,91 @@ reinstall_hy2(){
     return 1
   fi
 
+  open_port "$new_port" udp
+  hy2_update_list_entry_by_port "$old_port" "$new_tag" "$new_port" "$domain" "$auth" "$up" "$down" "$obfs" "$cert_mode"
   svc restart xray
-  write_hy2_state "$port" "$domain" "$auth" "$up" "$down" "$obfs" "$cert_mode_saved"
-
-  green "HY2 重装成功（新端口: ${port}）"
-  if [ "$mode" = "1" ]; then
-    green "模式：继承旧配置，仅端口变更"
-  else
-    green "模式：全新重装（高级参数已生效）"
-  fi
+  green "重装成功：${old_port} -> ${new_port}"
 }
 
-uninstall_hy2(){
+show_hy2_links_only(){
+  cls
+  init_hy2_list
+  [ "$IP_CHECKED" = "1" ] || load_ip_cache >/dev/null 2>&1 || true
+  [ "$IP_CHECKED" = "1" ] || check_ip || true
+  local ip
+  ip="$(pick_node_host)"
+  [ -z "$ip" ] && ip=""
+  [ -z "$BASE_FULL" ] && BASE_FULL="Node"
+
+  local cnt; cnt="$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)"
+  [ "${cnt:-0}" -gt 0 ] || { red "暂无HY2实例"; return; }
+
+  green "=============== HY2链接 ================"
+  local list
+  list="$(jq -c '.[]' "$HY2_LIST")"
+  while IFS= read -r one; do
+    [ -z "$one" ] && continue
+    local p d a up down ob cm insec hn hy_host obf
+    p="$(echo "$one" | jq -r '.port')"
+    d="$(echo "$one" | jq -r '.domain')"
+    a="$(echo "$one" | jq -r '.auth')"
+    up="$(echo "$one" | jq -r '.up')"
+    down="$(echo "$one" | jq -r '.down')"
+    ob="$(echo "$one" | jq -r '.obfs')"
+    cm="$(echo "$one" | jq -r '.cert_mode')"
+    [[ "$up" =~ ^[0-9]+$ ]] || up=50
+    [[ "$down" =~ ^[0-9]+$ ]] || down=250
+    insec="0"; [ "$cm" = "self" ] && insec="1"
+    hn="${BASE_FULL} - HY2-${p}"
+    hy_host="$ip"; [ -z "$hy_host" ] && hy_host="$d"
+    if [ -n "$ob" ]; then
+      obf="&obfs=salamander&obfs-password=${ob}"
+    else
+      obf=""
+    fi
+    # 关键：改为 up/down，兼容常见客户端
+    purple "hysteria2://${a}@${hy_host}:${p}?sni=${d}&insecure=${insec}${obf}&up=${up}&down=${down}#$(url_encode "$hn")"; echo
+  done <<< "$list"
+  echo "========================================"
+}
+
+manage_hy2(){
+  install_xray >/dev/null 2>&1 || true
+  ensure_dns_rule >/dev/null 2>&1 || true
+  init_hy2_list
+  migrate_old_hy2_state || true
+
+  while true; do
+    cls
+    echo -e "${C_WARN}=============== HY2管理（多实例） ===============${C_RST}"
+    hy2_list_show_table
+    echo "-----------------------------------------------------------------------"
+    menu_item_auto "1" "添加HY2实例"
+    menu_item_auto "2" "修改HY2实例"
+    menu_item_auto "3" "删除HY2实例"
+    menu_item_auto "4" "重装换端口(继承/追加UUID/全新)"
+    menu_item_auto "5" "查看HY2链接"
+    menu_item_auto "0" "返回"
+    echo "==============================================================="
+    prompt "请选择: " c
+    case "$c" in
+      1) configure_hy2_add; pause ;;
+      2) configure_hy2_edit; pause ;;
+      3) configure_hy2_delete; pause ;;
+      4) configure_hy2_reinstall_port; pause ;;
+      5) show_hy2_links_only; pause ;;
+      0) return ;;
+      *) red "无效"; pause ;;
+    esac
+  done
+}
+
+uninstall_hy2_all(){
   [ -f "$XRAY_CONF" ] || { red "xray未安装"; return 1; }
-  update_xray 'del(.inbounds[]? | select(.tag=="hy2-in" or .protocol=="hysteria" or .protocol=="hysteria2"))'
-  rm -f "$HY2_STATE"
-  svc restart xray; green "HY2 已卸载"
+  update_xray 'del(.inbounds[]? | select(.protocol=="hysteria" or .protocol=="hysteria2" or (.tag|tostring|startswith("hy2-"))))'
+  rm -f "$HY2_STATE" "$HY2_LIST"
+  svc restart xray
+  green "HY2 全部实例已卸载"
 }
 
 # ========== Nodes ==========
@@ -1043,6 +1401,7 @@ show_xray_nodes(){
       cnt=$((cnt+1))
     fi
   fi
+
   local sl
   sl="$(jq -c '.inbounds[]? | select(.protocol=="socks")' "$XRAY_CONF" 2>/dev/null || true)"
   if [ -n "$sl" ] && [ -n "$ip" ]; then
@@ -1055,30 +1414,42 @@ show_xray_nodes(){
       cnt=$((cnt+1))
     done <<< "$sl"
   fi
-  if [ -f "$HY2_STATE" ]; then
-    . "$HY2_STATE" 2>/dev/null || true
-    if [ -n "${PORT:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${PASS:-}" ]; then
-      local hn insecure="0" hy_host upmbps downmbps
-      hn="${BASE_FULL} - HY2"
-      if [ "${CERT_MODE:-cf}" = "self" ]; then insecure="1"; fi
-      hy_host="$ip"; [ -z "$hy_host" ] && hy_host="$DOMAIN"
-      upmbps="${UP:-50}"; downmbps="${DOWN:-250}"
-      [[ "$upmbps" =~ ^[0-9]+$ ]] || upmbps=50; [[ "$downmbps" =~ ^[0-9]+$ ]] || downmbps=250
-      if [ -n "${OBFS:-}" ]; then
-        purple "hysteria2://${PASS}@${hy_host}:${PORT}?sni=${DOMAIN}&insecure=${insecure}&obfs=salamander&obfs-password=${OBFS}&upmbps=${upmbps}&downmbps=${downmbps}#$(url_encode "$hn")"; echo
+
+  init_hy2_list
+  if [ -f "$HY2_LIST" ] && [ "$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then
+    local list
+    list="$(jq -c '.[]' "$HY2_LIST" 2>/dev/null || true)"
+    while IFS= read -r one; do
+      [ -z "$one" ] && continue
+      local p d a up down ob cm insec hn hy_host obf
+      p="$(echo "$one" | jq -r '.port')"
+      d="$(echo "$one" | jq -r '.domain')"
+      a="$(echo "$one" | jq -r '.auth')"
+      up="$(echo "$one" | jq -r '.up')"
+      down="$(echo "$one" | jq -r '.down')"
+      ob="$(echo "$one" | jq -r '.obfs')"
+      cm="$(echo "$one" | jq -r '.cert_mode')"
+      [[ "$up" =~ ^[0-9]+$ ]] || up=50
+      [[ "$down" =~ ^[0-9]+$ ]] || down=250
+      insec="0"; [ "$cm" = "self" ] && insec="1"
+      hn="${BASE_FULL} - HY2-${p}"
+      hy_host="$ip"; [ -z "$hy_host" ] && hy_host="$d"
+      if [ -n "$ob" ]; then
+        obf="&obfs=salamander&obfs-password=${ob}"
       else
-        purple "hysteria2://${PASS}@${hy_host}:${PORT}?sni=${DOMAIN}&insecure=${insecure}&upmbps=${upmbps}&downmbps=${downmbps}#$(url_encode "$hn")"; echo
+        obf=""
       fi
+      purple "hysteria2://${a}@${hy_host}:${p}?sni=${d}&insecure=${insec}${obf}&up=${up}&down=${down}#$(url_encode "$hn")"; echo
       cnt=$((cnt+1))
-    fi
+    done <<< "$list"
   fi
+
   [ "$cnt" -eq 0 ] && yellow "暂无配置节点"
   echo "=========================================="
 }
 
 # ========== Socks5 ==========
 manage_socks5(){
-  # 若未安装 xray，先引导安装
   if [ ! -f "$XRAY_CONF" ]; then
     cls
     red "未检测到 Xray"
@@ -1096,8 +1467,6 @@ manage_socks5(){
 
   while true; do
     cls
-
-    # 读取 socks 入站列表（每行一个 JSON 对象）
     local list
     list="$(jq -c '.inbounds[]? | select(.protocol=="socks")' "$XRAY_CONF" 2>/dev/null || true)"
 
@@ -1140,8 +1509,6 @@ manage_socks5(){
           pause
           continue
         fi
-
-        # 端口冲突检查：Xray 配置内是否已存在
         ex="$(jq --argjson p "$p" '[.inbounds[]? | select(.port==$p)] | length' "$XRAY_CONF" 2>/dev/null || echo 0)"
         if [ "${ex:-0}" -gt 0 ]; then
           red "端口已存在于Xray配置"
@@ -1178,7 +1545,6 @@ manage_socks5(){
           continue
         fi
 
-        # 将每行对象读入数组，便于按序号选择
         local -a rows=()
         mapfile -t rows < <(printf '%s\n' "$list" | sed '/^$/d')
 
@@ -1305,7 +1671,7 @@ foreground_xray_log(){
   svc start xray || true; sleep 1; is_running xray && green "xray 已恢复后台运行" || red "xray 恢复失败，请手动检查"; pause
 }
 
-# ========== Service Monitor (Revised) ==========
+# ========== Service Monitor ==========
 setup_service_monitor(){
   local svcname="tunnel-argo"
   if ! service_exists "$svcname"; then
@@ -1327,6 +1693,9 @@ setup_service_monitor(){
     fi
   fi
 
+  mkdir -p "$WORK"
+  [ -f "$MONITOR_DOWN_COUNT" ] || echo 0 > "$MONITOR_DOWN_COUNT"
+
   cat > "$monitor_script" <<'MONITOR_SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1334,6 +1703,7 @@ set -euo pipefail
 SVCNAME="tunnel-argo"
 WORK="/etc/xray"
 LOG="${WORK}/monitor_argo.log"
+DOWN_COUNT_FILE="${WORK}/monitor_argo_down.count"
 
 CHECK_INTERVAL=600
 RETRY_INTERVAL=20
@@ -1343,6 +1713,16 @@ WAIT_AFTER_FAILURE=600
 
 READY_URL="http://127.0.0.1:2000/ready"
 METRICS_URL="http://127.0.0.1:2000/metrics"
+
+[ -f "$DOWN_COUNT_FILE" ] || echo 0 > "$DOWN_COUNT_FILE"
+
+inc_down_count() {
+  local c=0
+  c="$(cat "$DOWN_COUNT_FILE" 2>/dev/null || echo 0)"
+  [[ "$c" =~ ^[0-9]+$ ]] || c=0
+  c=$((c+1))
+  echo "$c" > "$DOWN_COUNT_FILE"
+}
 
 http_ok() {
   local url="$1"
@@ -1368,11 +1748,9 @@ metrics_valid() {
 }
 
 health_check() {
-  # 1) 优先 /ready
   if http_ok "$READY_URL"; then
     return 0
   fi
-  # 2) 回退 /metrics
   metrics_valid
 }
 
@@ -1409,6 +1787,8 @@ while true; do
   done
 
   if [ "$check_failed" -eq 1 ]; then
+    inc_down_count
+    echo "[$(date '+%F %T')] 掉线计数 +1，当前: $(cat "$DOWN_COUNT_FILE" 2>/dev/null || echo 0)" >> "$LOG"
     echo "[$(date '+%F %T')] 连续${MAX_RETRIES}次失败，重启服务..." >> "$LOG"
     restart_svc
     sleep "$RESTART_DELAY"
@@ -1456,6 +1836,55 @@ stop_service_monitor(){
   else
     yellow "未设置服务监控"
   fi
+}
+
+view_service_monitor_log(){
+  cls
+  echo -e "${C_WARN}=========== 服务监控日志 ===========${C_RST}"
+  if [ -f "$MONITOR_LOG" ]; then
+    tail -n 120 "$MONITOR_LOG"
+  else
+    yellow "暂无日志: $MONITOR_LOG"
+  fi
+  echo "-------------------------------------"
+  local c
+  c="$(cat "$MONITOR_DOWN_COUNT" 2>/dev/null || echo 0)"
+  [[ "$c" =~ ^[0-9]+$ ]] || c=0
+  green "累计掉线次数: $c"
+}
+
+manage_service_monitor(){
+  while true; do
+    cls
+    local running="未运行" pid=""
+    if [ -f "${WORK}/monitor_argo.pid" ]; then
+      pid="$(cat "${WORK}/monitor_argo.pid" 2>/dev/null || true)"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        running="运行中(PID: $pid)"
+      fi
+    fi
+    local c
+    c="$(cat "$MONITOR_DOWN_COUNT" 2>/dev/null || echo 0)"
+    [[ "$c" =~ ^[0-9]+$ ]] || c=0
+
+    echo -e "${C_WARN}=========== 服务监控管理 ===========${C_RST}"
+    echo -e "状态: \033[1;36m${running}\033[0m"
+    echo -e "累计掉线: \033[1;36m${c}\033[0m"
+    echo "-------------------------------------"
+    menu_item_auto "1" "启动监控"
+    menu_item_auto "2" "停止监控"
+    menu_item_auto "3" "查看日志"
+    menu_item_auto "0" "返回"
+    echo "====================================="
+    prompt "请选择: " x
+    case "$x" in
+      1) setup_service_monitor; pause ;;
+      2) stop_service_monitor; pause ;;
+      3) view_service_monitor_log; pause ;;
+      0) return ;;
+      *) red "无效"; pause ;;
+    esac
+  done
 }
 
 # ========== SWAP ==========
@@ -1536,27 +1965,32 @@ install_shortcut(){
   mkdir -p "$WORK"
   local mark="${WORK}/.shortcut_done"
   local local_script="${WORK}/manager.sh"
-  local dst="/usr/local/bin/ssgo"
-  local url1="${SCRIPT_URL:-https://raw.githubusercontent.com/KisThFir/Xray-ssgo/refs/heads/main/Xray_ssgo.sh}"
-  local url2="https://raw.githubusercontent.com/KisThFir/Xray-ssgo/main/Xray_ssgo.sh"
+  local dst="/usr/local/bin/xray"
+  local url1="${SCRIPT_URL:-https://raw.githubusercontent.com/cocihateu/Xray-lite/refs/heads/main/Xray_lite.sh}"
+  local url2="https://raw.githubusercontent.com/cocihateu/Xray-lite/main/Xray_lite.sh"
+
   yellow "正在拉取脚本到本地: ${local_script}"
   if ! smart_download "$local_script" "$url1" 5000; then
     yellow "主地址失败，尝试备用地址..."
     smart_download "$local_script" "$url2" 5000 || { red "拉取失败: $url1"; return 1; }
   fi
+
   chmod 755 "$WORK" 2>/dev/null || true
   chmod 700 "$local_script" 2>/dev/null || chmod +x "$local_script" || true
   chown root:root "$local_script" 2>/dev/null || true
-  mkdir -p /usr/local/bin /usr/bin
+
+  mkdir -p /usr/local/bin
   cat > "$dst" <<'EOF'
 #!/usr/bin/env bash
 exec bash /etc/xray/manager.sh "$@"
 EOF
-  chmod 755 "$dst"; chown root:root "$dst" 2>/dev/null || true
-  ln -sf "$dst" /usr/bin/ssgo; chmod 755 /usr/bin/ssgo 2>/dev/null || true; chown -h root:root /usr/bin/ssgo 2>/dev/null || true
+  chmod 755 "$dst"
+  chown root:root "$dst" 2>/dev/null || true
+
   touch "$mark"; chmod 600 "$mark" 2>/dev/null || true
-  green "快捷方式已创建：ssgo -> /etc/xray/manager.sh"
+  green "快捷方式已创建：xray -> /etc/xray/manager.sh"
 }
+
 full_uninstall(){
   svc stop tunnel-argo; svc disable tunnel-argo
   svc stop xray; svc disable xray
@@ -1572,13 +2006,13 @@ full_uninstall(){
   command -v crontab >/dev/null 2>&1 && \
     (crontab -l 2>/dev/null | sed '/#svc-restart-all/d') | crontab - 2>/dev/null || true
   swap_disable_all >/dev/null 2>&1 || true
-  rm -f /usr/local/bin/ssgo /usr/bin/ssgo
+  rm -f /usr/local/bin/xray
   rm -rf "$WORK"
   rm -rf /etc/ssgo
   green "已彻底卸载（服务/配置/快捷方式/监控/SWAP 已清理）"
 }
 
-# ========== Outbound menu (Revised) ==========
+# ========== Outbound menu ==========
 manage_outbound_menu(){
   while true; do
     cls
@@ -1667,32 +2101,36 @@ xray_menu(){
     local xs as hs
     if [ -x "$XRAY_BIN" ]; then xs=$(is_running xray && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else xs="${C_BAD}未安装${C_RST}"; fi
     if service_exists tunnel-argo; then as=$(is_running tunnel-argo && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else as="${C_BAD}未配置${C_RST}"; fi
-    if [ -f "$HY2_STATE" ]; then hs="\033[1;36m已配置\033[0m"; else hs="${C_BAD}未配置${C_RST}"; fi
+    init_hy2_list
+    if [ "$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then hs="\033[1;36m已配置\033[0m"; else hs="${C_BAD}未配置${C_RST}"; fi
+
     echo -e "${C_OK}=============== Xray管理 ===============${C_RST}"
     echo -e "Xray: ${xs}   Argo: ${as}   HY2: ${hs}"
     echo "-----------------------------------------------"
     menu_row2_auto "1"  "安装Argo"      "8"  "实时日志"
-    menu_row2_auto "2"  "安装HY2"       "9"  "查看节点"
+    menu_row2_auto "2"  "配置HY2"       "9"  "查看节点"
     menu_row2_auto "3"  "配置Socks5"    "10" "修改UUID"
     menu_row2_auto "4"  "重启Argo"      "0"  "返回"
     menu_row2_auto "5"  "重启Xray"
     menu_row2_auto "6"  "卸载Argo"
     menu_row2_auto "7"  "卸载HY2"
-    menu_row2_auto "11" "重装HY2"
+    menu_row2_auto "11" "卸载Xray"
+    menu_row2_auto "12" "更新Xray"
     echo "==============================================="
     prompt "请选择: " c
     case "$c" in
       1) install_argo; pause ;;
-      2) install_hy2; pause ;;
+      2) manage_hy2 ;;
       3) manage_socks5 ;;
       4) service_exists tunnel-argo && svc restart tunnel-argo && green "Argo 已重启" || red "Argo未安装"; pause ;;
       5) service_exists xray && svc restart xray && green "Xray 已重启" || red "Xray未安装"; pause ;;
       6) uninstall_argo; pause ;;
-      7) uninstall_hy2; pause ;;
+      7) uninstall_hy2_all; pause ;;
       8) foreground_xray_log ;;
       9) show_xray_nodes; pause ;;
       10) prompt "新UUID(回车自动): " u; [ -z "$u" ] && u="$(gen_uuid)"; set_xray_uuid "$u"; pause ;;
-      11) reinstall_hy2; pause ;;
+      11) uninstall_xray_only; pause ;;
+      12) update_xray_core; pause ;;
       0) return ;;
       *) red "无效"; pause ;;
     esac
@@ -1794,6 +2232,9 @@ main_menu(){
   ensure_deps || { red "依赖安装失败，请检查网络/源"; exit 1; }
   mkdir -p "$WORK"
   load_state
+  init_hy2_list
+  migrate_old_hy2_state || true
+
   load_ip_cache >/dev/null 2>&1 || true
   [ "$IP_CHECKED" = "1" ] || {
     cls; echo -e "\033[1;33mIP信息加载中，请稍候...\033[0m"
@@ -1845,12 +2286,11 @@ main_menu(){
     case "$c" in
       1) xray_menu ;;
       2) manage_outbound_menu ;;
-      3) setup_service_monitor; pause ;;
+      3) manage_service_monitor ;;
       0) cls; exit 0 ;;
       6) manage_swap ;;
       8) install_shortcut; pause ;;
       9) full_uninstall; pause ;;
-      
       *) red "无效"; pause ;;
     esac
   done
