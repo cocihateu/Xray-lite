@@ -2160,24 +2160,59 @@ xray_menu(){
 # ========== System info ==========
 detect_virt_name(){
   local v=""
+
+  # 1) systemd-detect-virt（最优先）
   if command -v systemd-detect-virt >/dev/null 2>&1; then
     v="$(systemd-detect-virt 2>/dev/null || true)"
-    [ -n "$v" ] && [ "$v" != "none" ] && { echo "${v^^}"; return; }
+    case "${v,,}" in
+      podman) echo "PODMAN"; return ;;
+      docker) echo "DOCKER"; return ;;
+      lxc) echo "LXC"; return ;;
+      containerd) echo "CONTAINERD"; return ;;
+      openvz|kvm|qemu|vmware|xen) echo "${v^^}"; return ;;
+      container) ;;   # 继续细分，不直接返回
+      none|"") ;;
+      *) echo "${v^^}"; return ;;
+    esac
   fi
-  if [ -f /run/systemd/container ]; then
+
+  # 2) systemd 标记文件
+  if [ -r /run/systemd/container ]; then
     v="$(cat /run/systemd/container 2>/dev/null || true)"
-    [ -n "$v" ] && { echo "${v^^}"; return; }
+    case "${v,,}" in
+      podman) echo "PODMAN"; return ;;
+      docker) echo "DOCKER"; return ;;
+      lxc) echo "LXC"; return ;;
+      containerd) echo "CONTAINERD"; return ;;
+      "") ;;
+      *) echo "${v^^}"; return ;;
+    esac
   fi
-  if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=lxc$'; then echo "LXC"; return; fi
+
+  # 3) /proc/1/environ
+  if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=podman$'; then echo "PODMAN"; return; fi
   if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=docker$'; then echo "DOCKER"; return; fi
-  if grep -qaE '(lxc|docker|containerd|kubepods|podman)' /proc/1/cgroup 2>/dev/null; then
-    if grep -qa 'lxc' /proc/1/cgroup 2>/dev/null; then echo "LXC"; return; fi
-    if grep -qa 'docker' /proc/1/cgroup 2>/dev/null; then echo "DOCKER"; return; fi
-    if grep -qa 'containerd' /proc/1/cgroup 2>/dev/null; then echo "CONTAINERD"; return; fi
+  if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=lxc$'; then echo "LXC"; return; fi
+  if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=containerd$'; then echo "CONTAINERD"; return; fi
+
+  # 4) cgroup（兼容 v1/v2）
+  if grep -qaE '(podman|docker|containerd|kubepods|lxc)' /proc/1/cgroup 2>/dev/null; then
     if grep -qa 'podman' /proc/1/cgroup 2>/dev/null; then echo "PODMAN"; return; fi
+    if grep -qa 'docker' /proc/1/cgroup 2>/dev/null; then echo "DOCKER"; return; fi
+    if grep -qa 'containerd\|kubepods' /proc/1/cgroup 2>/dev/null; then echo "CONTAINERD"; return; fi
+    if grep -qa 'lxc' /proc/1/cgroup 2>/dev/null; then echo "LXC"; return; fi
     echo "CONTAINER"; return
   fi
-  [ -f /proc/1/ns/mnt ] && [ -d /dev/lxd ] && { echo "LXC"; return; }
+
+  # 5) Podman 常见文件痕迹（补强）
+  [ -f /run/.containerenv ] && { echo "PODMAN"; return; }
+  [ -f /.dockerenv ] && { echo "DOCKER"; return; }
+
+  # 6) 其他容器泛化
+  if grep -qaE '(container|podman|docker)' /proc/1/mountinfo 2>/dev/null; then
+    echo "CONTAINER"; return
+  fi
+
   echo "UNKNOWN"
 }
 arch_disp(){
