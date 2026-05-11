@@ -121,7 +121,6 @@ SS_FIXED_IP="172.64.147.74"
 
 # XHTTP random padding header/key (<=6 alnum)
 XHTTP_PAD="$(tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 6 || true)"
-[ -z "${XHTTP_PAD:-}" ] && XHTTP_PAD="y2k"
 
 XHTTP_MODE="auto"
 XHTTP_EXTRA_JSON="{\"xPaddingObfsMode\":true,\"xPaddingMethod\":\"tokenish\",\"xPaddingPlacement\":\"queryInHeader\",\"xPaddingHeader\":\"${XHTTP_PAD}\",\"xPaddingKey\":\"_${XHTTP_PAD}\"}"
@@ -693,15 +692,34 @@ apply_policy_xray(){
       + [ .outbounds[]? | select(.tag!="direct" and .tag!="direct-v4" and .tag!="direct-v6" and .tag!="block-v4" and .tag!="dns-out") ]
     )'
   update_xray 'del(.routing.rules[]? | select(
-    .tag=="v6-strict-rule" or
-    .tag=="v6-geosite-strict-route-rule" or
-    .tag=="v6-geosite-strict-reject-rule"
-  ))'
+  .tag=="v6-strict-rule" or
+  .tag=="v6-strict-route-rule" or
+  .tag=="v6-strict-reject-rule" or
+  .tag=="v6-geosite-strict-route-rule" or
+  .tag=="v6-geosite-strict-reject-rule"
+))'
   local v6_domains
   v6_domains="$(build_v6_domains_json)"
   if [ "$(echo "$v6_domains" | jq 'length')" -gt 0 ]; then
-    update_xray --argjson d "$v6_domains" '.routing.rules += [{"type":"field","domain":($d|map("domain:"+.)),"outboundTag":"direct-v6","tag":"v6-strict-rule"}]'
-  fi
+  # 1) 先拦IPv4（严格）
+  update_xray --argjson d "$v6_domains" \
+    '.routing.rules += [{
+      "type":"field",
+      "domain":($d|map("domain:"+.)),
+      "ip":["0.0.0.0/0"],
+      "outboundTag":"block-v4",
+      "tag":"v6-strict-reject-rule"
+    }]'
+
+  # 2) 再走IPv6
+  update_xray --argjson d "$v6_domains" \
+    '.routing.rules += [{
+      "type":"field",
+      "domain":($d|map("domain:"+.)),
+      "outboundTag":"direct-v6",
+      "tag":"v6-strict-route-rule"
+    }]'
+fi
   if [ "$YOUTUBE_MODE" = "2" ]; then
     if ensure_geosite; then
       update_xray '.routing.rules += [{"type":"field","domain":["geosite:youtube"],"ip":["0.0.0.0/0"],"outboundTag":"block-v4","tag":"v6-geosite-strict-reject-rule"}]'
@@ -1054,7 +1072,7 @@ configure_hy2_add(){
     port="$(hy2_random_free_port 0)"
   else
     [[ "$port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
-    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { red "端口越界"; return 1; }
+    [ "$port" -ge 20000 ] && [ "$port" -le 65000 ] || { red "端口越界(20000-65000)"; return 1; }
     if hy2_port_exists_in_conf "$port"; then red "端口已被HY2占用"; return 1; fi
     if ss -tuln 2>/dev/null | grep -q ":${port} "; then yellow "警告：系统检测该端口可能被占用"; fi
   fi
@@ -1224,9 +1242,9 @@ configure_hy2_reinstall_port(){
   [ -z "$pm" ] && pm=1
   case "$pm" in
     2)
-      prompt "输入新端口(1-65535): " new_port
-      [[ "$new_port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
-      [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ] || { red "端口越界"; return 1; }
+      prompt "输入新端口(20000-65000): " new_port
+[[ "$new_port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+[ "$new_port" -ge 20000 ] && [ "$new_port" -le 65000 ] || { red "端口越界(20000-65000)"; return 1; }
       [ "$new_port" -ne "$old_port" ] || { red "新端口不能与旧端口相同"; return 1; }
       if hy2_port_exists_in_conf "$new_port"; then red "端口已被HY2占用"; return 1; fi
       ;;
@@ -1505,7 +1523,7 @@ manage_socks5(){
     case "$c" in
       1)
         local p u pw ex
-        prompt "端口(1-65535): " p
+        prompt "端口(20000-65000): " p
         prompt "用户名: " u
         prompt "密码: " pw
 
@@ -2013,7 +2031,6 @@ full_uninstall(){
   swap_disable_all >/dev/null 2>&1 || true
   rm -f /usr/local/bin/xray
   rm -rf "$WORK"
-  rm -rf /etc/ssgo
   green "已彻底卸载（服务/配置/快捷方式/监控/SWAP 已清理）"
 }
 
