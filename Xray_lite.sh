@@ -28,7 +28,16 @@ cls(){ clear; printf '\033[3J\033[2J\033[H'; }
 url_encode(){ jq -rn --arg x "$1" '$x|@uri'; }
 
 [ "$EUID" -ne 0 ] && red "请用 root 运行" && exit 1
-[ -t 0 ] || { red "请在交互终端运行"; exit 1; }
+
+# 兼容 curl|bash：若 stdin 不是TTY，则尝试切到 /dev/tty
+if [ ! -t 0 ]; then
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    exec </dev/tty
+  else
+    red "请在交互终端运行"
+    exit 1
+  fi
+fi
 
 # ========== Smart Menu Render ==========
 C_NUM="\033[1;36m"; C_TXT="\033[1;36m"
