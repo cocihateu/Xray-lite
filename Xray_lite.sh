@@ -964,7 +964,6 @@ hy2_build_inbound_json(){
     "network":"hysteria",
     "security":"tls",
     "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
-    "hysteriaSettings":{"version":2},
     "finalmask":{
       "udp":[{"type":"salamander","settings":{"password":$obfs}}],
       "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
@@ -990,7 +989,6 @@ hy2_build_inbound_json(){
     "network":"hysteria",
     "security":"tls",
     "tlsSettings":{"alpn":["h3"],"certificates":[{"certificateFile":$crt,"keyFile":$key}],"serverName":$domain},
-    "hysteriaSettings":{"version":2},
     "finalmask":{
       "quicParams":{"congestion":"bbr","bbrProfile":"standard","maxIdleTimeout":30,"keepAlivePeriod":10,"disablePathMTUDiscovery":false}
     }
