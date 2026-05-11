@@ -120,7 +120,7 @@ CFIP=${CFIP:-'172.67.146.150'}
 SS_FIXED_IP="172.64.147.74"
 
 # XHTTP random padding header/key (<=6 alnum)
-XHTTP_PAD="$(tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 6)"
+XHTTP_PAD="$(tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 6 || true)"
 [ -z "${XHTTP_PAD:-}" ] && XHTTP_PAD="y2k"
 
 XHTTP_MODE="auto"
@@ -186,7 +186,7 @@ ensure_deps(){
 # ========== Helpers ==========
 rand_alnum(){
   local n="${1:-6}"
-  tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c "$n"
+  tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c "$n" || true
 }
 
 detect_xray_arch(){
