@@ -1010,25 +1010,21 @@ hy2_list_show_table(){
     echo -e "当前: ${C_BAD}未配置${C_RST}"
     return
   fi
-  echo "-----------------------------------------------------------------------"
-  echo " 序号 | 端口   | 域名                  | 认证(auth) | 证书 | 混淆 | 带宽"
-  echo "-----------------------------------------------------------------------"
+
+  echo "------------------------------"
+  echo " 序号 | 端口"
+  echo "------------------------------"
+
   local i=1
   while IFS= read -r one; do
     [ -z "$one" ] && continue
-    local p d a cm ob up down
+    local p
     p="$(echo "$one" | jq -r '.port')"
-    d="$(echo "$one" | jq -r '.domain')"
-    a="$(echo "$one" | jq -r '.auth')"
-    cm="$(echo "$one" | jq -r '.cert_mode')"
-    ob="$(echo "$one" | jq -r '.obfs')"
-    up="$(echo "$one" | jq -r '.up')"
-    down="$(echo "$one" | jq -r '.down')"
-    [ -z "$ob" ] && ob="-"
-    printf " %-4s| %-7s| %-22s| %-11s| %-4s| %-4s| %s/%s\n" "$i" "$p" "$d" "${a:0:11}" "$cm" "$ob" "$up" "$down"
+    printf " %-4s| %s\n" "$i" "$p"
     i=$((i+1))
   done <<< "$list"
 }
+
 hy2_pick_by_index(){
   local idx="$1"
   init_hy2_list
@@ -1212,7 +1208,7 @@ configure_hy2_reinstall_port(){
   cls
   echo -e "${C_WARN}========== HY2端口重装模式 ==========${C_RST}"
   echo "1) 继承模式（仅换端口）"
-  echo "2) 追加UUID（换端口+重置AUTH随机UUID）"
+  echo "2) 追加UUID（换端口+重置AUTH）"
   echo "3) 全新安装（换端口+可改证书/域名/AUTH/OBFS/带宽）"
   echo "0) 取消"
   prompt "请选择: " mode
@@ -1358,7 +1354,7 @@ manage_hy2(){
     menu_item_auto "1" "添加HY2实例"
     menu_item_auto "2" "修改HY2实例"
     menu_item_auto "3" "删除HY2实例"
-    menu_item_auto "4" "重装换端口(继承/追加UUID/全新)"
+    menu_item_auto "4" "重装随机端口"
     menu_item_auto "5" "查看HY2链接"
     menu_item_auto "0" "返回"
     echo "==============================================================="
@@ -2031,18 +2027,18 @@ manage_outbound_menu(){
     [ -z "$v6_disp" ] && v6_disp="（空）"
     echo -e "${C_WARN}========== 出站管理（Xray）==========${C_RST}"
     echo -e "默认出站: \033[1;36mIPv4\033[0m"
-    echo -e "IPv6出站(严格): \033[1;36m${v6_disp}\033[0m"
-    echo -e "YouTube V6出站: \033[1;36m$( [ "$YOUTUBE_MODE" = "2" ] && echo '开启(严格)' || echo '关闭' )\033[0m"
+    echo -e "IPv6 出站(严格): \033[1;36m${v6_disp}\033[0m"
+    echo -e "YouTube V6 出站: \033[1;36m$( [ "$YOUTUBE_MODE" = "2" ] && echo '开启(严格)' || echo '关闭' )\033[0m"
     echo "-----------------------------------------------"
-    menu_item_auto "1" "设置YouTube V6出站"; menu_item_auto "2" "管理IPv6出站列表"; menu_item_auto "0" "返回"
+    menu_item_auto "1" "设置 YouTube V6 出站"; menu_item_auto "2" "管理 IPv6 出站列表"; menu_item_auto "0" "返回"
     echo "==============================================="
     prompt "请选择: " c
     case "$c" in
       1)
         prompt "输入模式(1=关闭 2=开启(严格)): " m
         case "$m" in
-          1) YOUTUBE_MODE=1; green "已关闭YouTube V6出站" ;;
-          2) YOUTUBE_MODE=2; green "已开启YouTube V6出站(严格)" ;;
+          1) YOUTUBE_MODE=1; green "已关闭 YouTube V6 出站" ;;
+          2) YOUTUBE_MODE=2; green "已开启 YouTube V6 出站(严格)" ;;
           *) red "输入无效" ;;
         esac
         save_outbound; apply_policy_all; pause ;;
@@ -2053,7 +2049,7 @@ manage_outbound_menu(){
           list_json="$(build_v6_domains_json)"
           list_disp="$(echo "$list_json" | jq -r 'join(",")')"
           [ -z "$list_disp" ] && list_disp="（空）"
-          echo -e "${C_WARN}===== IPv6出站列表（严格） =====${C_RST}"
+          echo -e "${C_WARN}===== IPv6 出站列表（严格） =====${C_RST}"
           echo -e "当前列表: \033[1;36m${list_disp}\033[0m"
           echo "-----------------------------------------------"
           menu_item_auto "1" "添加域名"; menu_item_auto "2" "删除域名"; menu_item_auto "0" "返回"
@@ -2072,7 +2068,7 @@ manage_outbound_menu(){
               save_outbound; apply_policy_all; green "已添加并应用"; pause ;;
             2)
               if [ "$(echo "$list_json" | jq 'length')" -eq 0 ]; then red "列表为空"; pause; continue; fi
-              echo "当前IPv6出站域名："
+              echo "当前 IPv6 出站域名："
               echo "$list_json" | jq -r '.[]' | nl -w2 -s'. '
               echo "输入序号（支持 1,3,5 ）或 a 全删，0取消"
               prompt "输入: " list
