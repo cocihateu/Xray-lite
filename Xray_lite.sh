@@ -59,7 +59,7 @@ auto_hl(){
     printf "%b%s%b%b卸载%b%b%s%b" "$C_TXT" "$left" "$C_RST" "$C_BAD" "$C_RST" "$C_TXT" "$right" "$C_RST"
     return
   fi
-  for pre in 管理 安装 查看 修改 重启 设置 创建 实时 配置 启用 关闭 删除 添加 定时 彻底 更新; do
+  for pre in 管理 安装 查看 修改 重启 设置 创建 实时 配置 启用 关闭 删除 添加 定时 彻底 更新 切换; do
     if [[ "$s" == "$pre"* ]]; then
       kw="${s#$pre}"
       if [ -z "$kw" ]; then printf "%b%s%b" "$C_TXT" "$s" "$C_RST"; else
@@ -95,14 +95,12 @@ XRAY_CONF="${WORK}/config.json"
 
 TLS_BASE="/etc/lite/tls"
 TLS_DIR_HY2="${TLS_BASE}/hy2"
-TLS_DIR_ORIGIN="${TLS_BASE}/origin"
+TLS_DIR_REALITY="${TLS_BASE}/reality"
 
 ARGO_DOMAIN="${WORK}/domain_argo.txt"
 ARGO_YML="${WORK}/tunnel_argo.yml"
 ARGO_JSON="${WORK}/tunnel_argo.json"
 
-# CF加速模式: argo | origin
-# origin 模式使用固定回源端口
 CF_MODE_CONF="${WORK}/cf_mode.conf"
 CF_MODE="argo"
 ORIGIN_VLESS_WS_PORT=62481
@@ -113,10 +111,22 @@ RESTART_CONF="${WORK}/restart.conf"
 OUTBOUND_CONF="${WORK}/outbound_policy.conf"
 IPCACHE="${WORK}/ip_cache.conf"
 
-# 兼容旧单实例文件（可迁移）
-HY2_STATE="${WORK}/hy2_state.conf"
-# 新多实例列表
 HY2_LIST="${WORK}/hy2_list.json"
+
+# REALITY 状态
+REALITY_LIST="${WORK}/reality_list.json"
+
+# Geodata 自动更新
+GEODATA_CONF="${WORK}/geodata_auto.conf"
+GEODATA_CRON_TAG="#xray-lite-geodata"
+GEODATA_SCRIPT="${WORK}/geodata_update.sh"
+GEODATA_LOG="${WORK}/geodata_update.log"
+GEODATA_DOWN_URL_GEOIP="https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geoip.dat"
+GEODATA_DOWN_URL_GEOSITE="https://github.com/Loyalsoldier/v2ray-rules-dat/raw/release/geosite.dat"
+GEODATA_MIN_GEOIP=300000
+GEODATA_MIN_GEOSITE=1000000
+GEODATA_TIMER_NAME="xray-geodata"
+GEODATA_AUTO=0
 
 SWAP_LOG="/tmp/swap.log"
 
@@ -125,7 +135,7 @@ MONITOR_LOG="${WORK}/monitor_argo.log"
 MONITOR_DOWN_COUNT="${WORK}/monitor_argo_down.count"
 
 UUID_FALLBACK="$(cat /proc/sys/kernel/random/uuid)"
-CFIP=${CFIP:-'172.67.146.150'}
+CFIP="172.67.146.150"
 SS_FIXED_IP="172.64.147.74"
 
 # XHTTP random padding header/key (<=6 alnum)
@@ -135,6 +145,14 @@ XHTTP_MODE="auto"
 XHTTP_EXTRA_JSON="{\"xPaddingObfsMode\":true,\"xPaddingMethod\":\"tokenish\",\"xPaddingPlacement\":\"queryInHeader\",\"xPaddingHeader\":\"${XHTTP_PAD}\",\"xPaddingKey\":\"_${XHTTP_PAD}\"}"
 
 HY2_SELF_SNI_DEFAULT="www.amd.com"
+
+# REALITY 默认 serverNames 候选（可像 zxcvos 那样选/自定义）
+REALITY_SN_CHOICES=(
+  "learn.microsoft.com"
+  "www.lovelive-anime.jp"
+  "music.apple.com"
+)
+REALITY_DEFAULT_SN="learn.microsoft.com"
 
 GHFAST_PREFIX="https://ghfast.top/"
 GH_SPEED_THRESHOLD_MBPS=20
@@ -165,7 +183,15 @@ pkg_install(){
   local pkgs=() p mapped
   for p in "$@"; do
     mapped="$p"
-    case "$mgr:$p" in dnf:iproute2|yum:iproute2) mapped="iproute" ;; apk:coreutils) mapped="coreutils" ;; apt:iproute2|apk:iproute2) mapped="iproute2" ;; esac
+    case "$mgr:$p" in
+      dnf:iproute2|yum:iproute2) mapped="iproute" ;;
+      apk:coreutils) mapped="coreutils" ;;
+      apt:iproute2|apk:iproute2) mapped="iproute2" ;;
+      yum:python3) mapped="python3" ;;
+      dnf:python3) mapped="python3" ;;
+      apt:python3) mapped="python3" ;;
+      apk:python3) mapped="python3" ;;
+    esac
     pkgs+=("$mapped")
   done
   case "$mgr" in
@@ -178,14 +204,16 @@ pkg_install(){
 ensure_deps(){
   need_cmd jq || pkg_install jq
   need_cmd wget || pkg_install wget
+  need_cmd curl || pkg_install curl
   need_cmd ip || pkg_install iproute2
   need_cmd base64 || pkg_install coreutils
   need_cmd tar || pkg_install tar
   need_cmd unzip || pkg_install unzip
   need_cmd openssl || pkg_install openssl
   need_cmd ss || pkg_install iproute2
+  need_cmd python3 || pkg_install python3
   [ -f /etc/alpine-release ] && pkg_install ca-certificates || true
-  for c in jq wget ip base64 tar unzip openssl; do
+  for c in jq wget curl ip base64 tar unzip openssl python3; do
     command -v "$c" >/dev/null 2>&1 || { red "依赖缺失: $c"; return 1; }
   done
   return 0
@@ -413,6 +441,19 @@ CF_MODE=${CF_MODE}
 EOF
 }
 
+load_geodata_conf(){
+  GEODATA_AUTO=0
+  [ -f "$GEODATA_CONF" ] || return 0
+  GEODATA_AUTO="$(awk -F= '/^GEODATA_AUTO=/{print $2}' "$GEODATA_CONF" 2>/dev/null || echo 0)"
+  [[ "$GEODATA_AUTO" =~ ^[01]$ ]] || GEODATA_AUTO=0
+}
+save_geodata_conf(){
+  mkdir -p "$WORK"
+  cat > "$GEODATA_CONF" <<EOF
+GEODATA_AUTO=${GEODATA_AUTO}
+EOF
+}
+
 load_state(){
   if [ -f "$RESTART_CONF" ]; then
     RESTART_HOURS="$(cat "$RESTART_CONF" 2>/dev/null || echo 0)"
@@ -424,6 +465,7 @@ load_state(){
     V6_SITES="$(awk -F= '/^V6_SITES=/{print $2}' "$OUTBOUND_CONF" 2>/dev/null)"
   fi
   load_cf_mode
+  load_geodata_conf
 }
 save_outbound(){
   mkdir -p "$WORK"
@@ -669,7 +711,7 @@ uninstall_xray_only(){
   cls
   echo -e "${C_WARN}=========== 卸载 Xray ===========${C_RST}"
   echo "1) 卸载程序与服务（保留配置）"
-  echo "2) 完全卸载（程序/服务/配置）"
+  echo "2) 完全卸载（不保留配置）"
   echo "0) 取消"
   prompt "请选择: " m
   case "$m" in
@@ -682,7 +724,7 @@ uninstall_xray_only(){
     2)
       svc stop xray; svc disable xray
       rm -f /etc/init.d/xray /etc/systemd/system/xray.service
-      rm -f "$XRAY_BIN" "$XRAY_CONF" "$HY2_STATE" "$HY2_LIST" "$CF_MODE_CONF"
+      rm -f "$XRAY_BIN" "$XRAY_CONF" "$HY2_LIST" "$CF_MODE_CONF" "$REALITY_LIST"
       command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
       green "Xray已完全卸载"
       ;;
@@ -690,6 +732,254 @@ uninstall_xray_only(){
       yellow "已取消"
       ;;
   esac
+}
+
+# ========== Geodata Auto Update ==========
+geodata_write_script(){
+  mkdir -p "$WORK"
+  cat > "$GEODATA_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+WORK="${WORK}"
+LOG="${GEODATA_LOG}"
+XRAY_BIN="${XRAY_BIN}"
+XRAY_CONF="${XRAY_CONF}"
+GEOIP_URL="${GEODATA_DOWN_URL_GEOIP}"
+GEOSITE_URL="${GEODATA_DOWN_URL_GEOSITE}"
+
+GHFAST_PREFIX="${GHFAST_PREFIX}"
+GH_SPEED_THRESHOLD_MBPS="${GH_SPEED_THRESHOLD_MBPS}"
+GH_SPEED_THRESHOLD_BPS="${GH_SPEED_THRESHOLD_BPS}"
+GH_USE_FAST_MIRROR=0
+GEOIP_MIN="${GEODATA_MIN_GEOIP}"
+GEOSITE_MIN="${GEODATA_MIN_GEOSITE}"
+
+mkdir -p "\${WORK}"
+tmp_geoip="\${WORK}/geoip.dat.new"
+tmp_geosite="\${WORK}/geosite.dat.new"
+
+is_github_url(){
+  case "\$1" in
+    https://github.com/*|https://raw.githubusercontent.com/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+ghfast_url(){
+  local u="\$1"
+  echo "\${GHFAST_PREFIX}\${u}"
+}
+smart_download(){
+  local out="\$1" url="\$2" min="\$3"
+  local t=0 u="" is_gh=0 elapsed sz speed
+  is_github_url "\$url" && is_gh=1 || is_gh=0
+
+  while [ "\$t" -lt 3 ]; do
+    rm -f "\$out"
+    if [ "\$is_gh" -eq 1 ] && [ "\${GH_USE_FAST_MIRROR:-0}" -eq 1 ]; then
+      u="\$(ghfast_url "\$url")"
+    else
+      u="\$url"
+    fi
+
+    local ts_start ts_end
+    ts_start="\$(date +%s)"
+    if command -v curl >/dev/null 2>&1; then
+      curl -L --connect-timeout 10 --max-time 180 -o "\$out" "\$u" >/dev/null 2>&1 || true
+    fi
+    if [ ! -s "\$out" ] && command -v wget >/dev/null 2>&1; then
+      if wget --help 2>&1 | grep -q -- '--show-progress'; then
+        wget -q --show-progress --timeout=40 --tries=1 -O "\$out" "\$u" || true
+      else
+        wget -q -T 40 -O "\$out" "\$u" || true
+      fi
+    fi
+    ts_end="\$(date +%s)"
+    elapsed=\$((ts_end - ts_start)); [ "\$elapsed" -le 0 ] && elapsed=1
+
+    if [ -f "\$out" ]; then
+      sz="\$(wc -c < "\$out" 2>/dev/null || echo 0)"
+      speed=\$((sz / elapsed))
+      if [ "\${sz:-0}" -ge "\$min" ]; then
+        if [ "\$is_gh" -eq 1 ] && [ "\${GH_USE_FAST_MIRROR:-0}" -eq 0 ] && [ "\$u" = "\$url" ]; then
+          if [ "\$speed" -lt "\${GH_SPEED_THRESHOLD_BPS:-2500000}" ]; then
+            echo "GitHub主站速度低于\${GH_SPEED_THRESHOLD_MBPS}Mbps，切换并锁定 ghfast 备用源"
+            GH_USE_FAST_MIRROR=1
+            rm -f "\$out"
+            t=\$((t+1))
+            sleep 1
+            continue
+          fi
+        fi
+        return 0
+      fi
+    fi
+
+    if [ "\$is_gh" -eq 1 ] && [ "\${GH_USE_FAST_MIRROR:-0}" -eq 0 ] && [ "\$u" = "\$url" ]; then
+      echo "GitHub主站下载失败，切换并锁定 ghfast 备用源"
+      GH_USE_FAST_MIRROR=1
+    fi
+
+    rm -f "\$out"
+    t=\$((t+1))
+    sleep 2
+  done
+  return 1
+}
+
+{
+  echo "=== [\$(date '+%F %T')] geodata update begin ==="
+
+  smart_download "\$tmp_geoip" "\$GEOIP_URL" "\$GEOIP_MIN"
+  smart_download "\$tmp_geosite" "\$GEOSITE_URL" "\$GEOSITE_MIN"
+
+  [ -s "\$tmp_geoip" ] || { echo "geoip.dat.new empty"; rm -f "\$tmp_geoip" "\$tmp_geosite"; exit 1; }
+  [ -s "\$tmp_geosite" ] || { echo "geosite.dat.new empty"; rm -f "\$tmp_geoip" "\$tmp_geosite"; exit 1; }
+
+  mv -f "\$tmp_geoip" "\${WORK}/geoip.dat"
+  mv -f "\$tmp_geosite" "\${WORK}/geosite.dat"
+  echo "geodata replaced"
+
+  if [ -x "\$XRAY_BIN" ] && [ -f "\$XRAY_CONF" ]; then
+    if "\$XRAY_BIN" run -test -c "\$XRAY_CONF" >/tmp/xray_geodata_check.log 2>&1; then
+      if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q '^xray\.service'; then
+        if [ "\$(systemctl is-active xray 2>/dev/null || true)" = "active" ]; then
+          systemctl restart xray || true
+          echo "xray restarted"
+        else
+          echo "xray not active, skip restart"
+        fi
+      elif [ -f /etc/init.d/xray ]; then
+        if rc-service xray status 2>/dev/null | grep -q started; then
+          rc-service xray restart || true
+          echo "xray restarted(openrc)"
+        else
+          echo "xray not active(openrc), skip restart"
+        fi
+      fi
+    else
+      echo "xray test failed after geodata update"
+      tail -n 50 /tmp/xray_geodata_check.log 2>/dev/null || true
+      exit 1
+    fi
+  fi
+  echo "=== [\$(date '+%F %T')] geodata update done ==="
+} >> "\$LOG" 2>&1
+EOF
+  chmod +x "$GEODATA_SCRIPT"
+}
+
+geodata_disable_cron(){
+  command -v crontab >/dev/null 2>&1 || return 0
+  (crontab -l 2>/dev/null | sed "/${GEODATA_CRON_TAG//\//\\/}/d") | crontab - 2>/dev/null || true
+}
+geodata_enable_cron(){
+  command -v crontab >/dev/null 2>&1 || return 1
+  geodata_disable_cron
+  (crontab -l 2>/dev/null; echo "17 4 * * * ${GEODATA_SCRIPT} ${GEODATA_CRON_TAG}") | crontab - 2>/dev/null || true
+}
+
+geodata_disable_systemd_timer(){
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now "${GEODATA_TIMER_NAME}.timer" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${GEODATA_TIMER_NAME}.service" "/etc/systemd/system/${GEODATA_TIMER_NAME}.timer"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+geodata_enable_systemd_timer(){
+  command -v systemctl >/dev/null 2>&1 || return 1
+  cat > "/etc/systemd/system/${GEODATA_TIMER_NAME}.service" <<EOF
+[Unit]
+Description=Xray geodata auto update
+
+[Service]
+Type=oneshot
+ExecStart=${GEODATA_SCRIPT}
+EOF
+  cat > "/etc/systemd/system/${GEODATA_TIMER_NAME}.timer" <<EOF
+[Unit]
+Description=Run Xray geodata updater daily
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now "${GEODATA_TIMER_NAME}.timer" >/dev/null 2>&1 || true
+}
+
+geodata_apply_schedule(){
+  geodata_write_script
+  if [ "$GEODATA_AUTO" = "1" ]; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+      geodata_enable_systemd_timer || true
+      geodata_disable_cron || true
+    else
+      geodata_enable_cron || true
+    fi
+  else
+    geodata_disable_systemd_timer || true
+    geodata_disable_cron || true
+  fi
+}
+
+geodata_update_now(){
+  geodata_write_script
+  if bash "$GEODATA_SCRIPT"; then
+    green "geodata 更新完成"
+  else
+    red "geodata 更新失败"
+    tail -n 80 "$GEODATA_LOG" 2>/dev/null || true
+    return 1
+  fi
+}
+
+geodata_status_str(){
+  [ "${GEODATA_AUTO:-0}" = "1" ] && echo "开启" || echo "关闭"
+}
+
+manage_geodata_menu(){
+  load_geodata_conf
+  while true; do
+    cls
+    local timer_state cron_state
+    timer_state="N/A"; cron_state="N/A"
+
+    if command -v systemctl >/dev/null 2>&1; then
+      if systemctl list-unit-files 2>/dev/null | grep -q "^${GEODATA_TIMER_NAME}\.timer"; then
+        timer_state="$(systemctl is-active "${GEODATA_TIMER_NAME}.timer" 2>/dev/null || echo inactive)"
+      else
+        timer_state="not-installed"
+      fi
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+      if crontab -l 2>/dev/null | grep -q "${GEODATA_CRON_TAG}"; then cron_state="enabled"; else cron_state="disabled"; fi
+    fi
+
+    echo -e "${C_WARN}=========== Geodata自动更新 ===========${C_RST}"
+    echo -e "开关状态: \033[1;36m$(geodata_status_str)\033[0m"
+    echo -e "systemd.timer: \033[1;36m${timer_state}\033[0m"
+    echo -e "crontab: \033[1;36m${cron_state}\033[0m"
+    echo "---------------------------------------"
+    menu_item_auto "1" "开启自动更新"
+    menu_item_auto "2" "关闭自动更新"
+    menu_item_auto "3" "立即更新一次"
+    menu_item_auto "4" "查看更新日志"
+    menu_item_auto "0" "返回"
+    echo "======================================="
+    prompt "请选择: " c
+    case "$c" in
+      1) GEODATA_AUTO=1; save_geodata_conf; geodata_apply_schedule; green "已开启 geodata 自动更新"; pause ;;
+      2) GEODATA_AUTO=0; save_geodata_conf; geodata_apply_schedule; green "已关闭 geodata 自动更新"; pause ;;
+      3) geodata_update_now; pause ;;
+      4) cls; tail -n 120 "$GEODATA_LOG" 2>/dev/null || yellow "暂无日志"; pause ;;
+      0) return ;;
+      *) red "无效"; pause ;;
+    esac
+  done
 }
 
 # ========== Outbound apply ==========
@@ -774,83 +1064,6 @@ cf_remove_argo_inbounds(){
   update_xray 'del(.inbounds[]? | select(.port==8081 or .port==8082 or .port==8083))'
 }
 
-# Cloudflare Origin CA 签发（端口回源用）
-issue_cert_cf_origin_ca(){
-  local domain="$1" token="$2" cert_dir="${3:-$TLS_DIR_ORIGIN}"
-  local key="${cert_dir}/origin.key"
-  local csr="/tmp/origin.csr"
-  local req="/tmp/cf-origin-req.json"
-  local crt="${cert_dir}/origin.crt"
-
-  mkdir -p "$cert_dir"
-
-  need_cmd openssl || pkg_install openssl
-  need_cmd jq || pkg_install jq
-  need_cmd python3 || pkg_install python3
-  command -v openssl >/dev/null 2>&1 || { red "缺少 openssl"; return 1; }
-  command -v jq >/dev/null 2>&1 || { red "缺少 jq"; return 1; }
-  command -v python3 >/dev/null 2>&1 || { red "缺少 python3"; return 1; }
-
-  if [ -s "$crt" ] && [ -s "$key" ]; then
-    if openssl x509 -in "$crt" -noout -checkend $((30*24*3600)) >/dev/null 2>&1; then
-      green "Origin CA证书已存在且有效(>30天): $domain"
-      return 0
-    else
-      yellow "Origin CA证书即将过期或已过期，重新签发: $domain"
-    fi
-  fi
-
-  yellow "生成私钥与CSR..."
-  openssl req -new -newkey rsa:2048 -nodes \
-    -keyout "$key" \
-    -out "$csr" \
-    -subj "/CN=${domain}" >/tmp/cf_origin_csr.log 2>&1 || {
-    red "生成CSR失败"
-    tail -n 80 /tmp/cf_origin_csr.log 2>/dev/null || true
-    return 1
-  }
-
-  local csr_json
-  csr_json="$(python3 - <<PY
-import json
-print(json.dumps(open("$csr","r").read()))
-PY
-)" || { red "CSR JSON编码失败"; return 1; }
-
-  cat > "$req" <<EOF
-{
-  "csr": ${csr_json},
-  "hostnames": ["${domain}","*.${domain}"],
-  "request_type": "origin-rsa",
-  "requested_validity": 5475
-}
-EOF
-
-  yellow "调用 Cloudflare Origin CA API 签发证书..."
-  local resp success cert
-  resp="$(curl -sS https://api.cloudflare.com/client/v4/certificates \
-    -H "Authorization: Bearer ${token}" \
-    -H "Content-Type: application/json" \
-    --data @"$req" 2>/tmp/cf_origin_api.err || true)"
-
-  success="$(echo "$resp" | jq -r '.success // false' 2>/dev/null || echo false)"
-  if [ "$success" != "true" ]; then
-    red "Origin CA签发失败"
-    echo "$resp" | jq . 2>/dev/null || echo "$resp"
-    [ -s /tmp/cf_origin_api.err ] && tail -n 50 /tmp/cf_origin_api.err
-    return 1
-  fi
-
-  cert="$(echo "$resp" | jq -r '.result.certificate // empty' 2>/dev/null || true)"
-  [ -n "$cert" ] || { red "API返回中未找到证书"; return 1; }
-
-  printf '%s\n' "$cert" > "$crt"
-  [ -s "$crt" ] || { red "写入证书失败"; return 1; }
-
-  chmod 600 "$key" "$crt" 2>/dev/null || true
-  green "Origin CA证书签发成功: $crt"
-}
-
 setup_cf_origin(){
   install_xray || return 1
   ensure_dns_rule || return 1
@@ -858,19 +1071,6 @@ setup_cf_origin(){
   local domain ss_pass mc ss_method uuid ws xh ss xh_json
   prompt "CF回源域名(用于SNI/Host): " domain
   [ -z "$domain" ] && { red "域名不能为空"; return 1; }
-
-  local cert_mode cert_file key_file cf_token
-  prompt "回源TLS证书模式(1=不启用TLS 2=CF Origin CA签发，默认1): " cert_mode
-  [ -z "${cert_mode:-}" ] && cert_mode=1
-  [[ "$cert_mode" =~ ^[12]$ ]] || cert_mode=1
-  cert_file=""; key_file=""
-  if [ "$cert_mode" = "2" ]; then
-    prompt "Cloudflare API Token: " cf_token
-    [ -z "$cf_token" ] && { red "Token不能为空"; return 1; }
-    issue_cert_cf_origin_ca "$domain" "$cf_token" "$TLS_DIR_ORIGIN" || return 1
-    cert_file="${TLS_DIR_ORIGIN}/origin.crt"
-    key_file="${TLS_DIR_ORIGIN}/origin.key"
-  fi
 
   prompt "SS密码(回车随机UUID): " ss_pass
   [ -z "$ss_pass" ] && ss_pass="$(gen_uuid)"
@@ -883,78 +1083,10 @@ setup_cf_origin(){
   cf_remove_argo_inbounds
   cf_remove_origin_inbounds
 
-  if [ "$cert_mode" = "2" ]; then
-    ws="$(jq -nc \
-      --argjson p "$ORIGIN_VLESS_WS_PORT" \
-      --arg uuid "$uuid" \
-      --arg host "$domain" \
-      --arg sni "$domain" \
-      --arg crt "$cert_file" \
-      --arg key "$key_file" \
-      '{
-        "port":$p,
-        "listen":"0.0.0.0",
-        "protocol":"vless",
-        "settings":{"clients":[{"id":$uuid}],"decryption":"none"},
-        "streamSettings":{
-          "network":"ws",
-          "security":"tls",
-          "tlsSettings":{"serverName":$sni,"certificates":[{"certificateFile":$crt,"keyFile":$key}]},
-          "wsSettings":{"path":"/argo","headers":{"Host":$host}}
-        },
-        "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
-      }')"
-
-    xh_json="$(jq -nc \
-      --argjson p "$ORIGIN_VLESS_XHTTP_PORT" \
-      --arg uuid "$uuid" \
-      --arg mode "$XHTTP_MODE" \
-      --argjson extra "$XHTTP_EXTRA_JSON" \
-      --arg host "$domain" \
-      --arg sni "$domain" \
-      --arg crt "$cert_file" \
-      --arg key "$key_file" \
-      '{
-        "port":$p,
-        "listen":"0.0.0.0",
-        "protocol":"vless",
-        "settings":{"clients":[{"id":$uuid}],"decryption":"none"},
-        "streamSettings":{
-          "network":"xhttp",
-          "security":"tls",
-          "tlsSettings":{"serverName":$sni,"certificates":[{"certificateFile":$crt,"keyFile":$key}]},
-          "xhttpSettings":{"host":$host,"path":"/xgo","mode":$mode,"extra":$extra}
-        },
-        "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
-      }')"
-
-    ss="$(jq -nc \
-      --argjson p "$ORIGIN_SS_WS_PORT" \
-      --arg method "$ss_method" \
-      --arg pass "$ss_pass" \
-      --arg host "$domain" \
-      --arg sni "$domain" \
-      --arg crt "$cert_file" \
-      --arg key "$key_file" \
-      '{
-        "port":$p,
-        "listen":"0.0.0.0",
-        "protocol":"shadowsocks",
-        "settings":{"method":$method,"password":$pass,"network":"tcp,udp"},
-        "streamSettings":{
-          "network":"ws",
-          "security":"tls",
-          "tlsSettings":{"serverName":$sni,"certificates":[{"certificateFile":$crt,"keyFile":$key}]},
-          "wsSettings":{"path":"/ssgo","headers":{"Host":$host}}
-        },
-        "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
-      }')"
-  else
-    ws='{"port":'"${ORIGIN_VLESS_WS_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
-    xh_json="$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" --arg host "$domain" \
-      '{"port":'"${ORIGIN_VLESS_XHTTP_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":$host,"path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')"
-    ss='{"port":'"${ORIGIN_SS_WS_PORT}"',"listen":"0.0.0.0","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
-  fi
+  ws='{"port":'"${ORIGIN_VLESS_WS_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  xh_json="$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" --arg host "$domain" \
+    '{"port":'"${ORIGIN_VLESS_XHTTP_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":$host,"path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')"
+  ss='{"port":'"${ORIGIN_SS_WS_PORT}"',"listen":"0.0.0.0","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
 
   update_xray --argjson ws "$ws" --argjson xh "$xh_json" --argjson ss "$ss" '.inbounds += [$ws,$xh,$ss]'
 
@@ -982,6 +1114,7 @@ setup_cf_origin(){
   ask_enable_youtube_strict
   green "CF加速已配置为 端口回源 模式（${ORIGIN_VLESS_WS_PORT}/${ORIGIN_VLESS_XHTTP_PORT}/${ORIGIN_SS_WS_PORT}）"
 }
+
 # ========== Argo ==========
 install_cloudflared(){
   mkdir -p "$WORK"
@@ -1132,26 +1265,6 @@ uninstall_argo(){
 init_hy2_list(){
   mkdir -p "$WORK"
   [ -f "$HY2_LIST" ] || echo '[]' > "$HY2_LIST"
-}
-migrate_old_hy2_state(){
-  [ -f "$HY2_STATE" ] || return 0
-  init_hy2_list
-  local has
-  has="$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)"
-  if [ "${has:-0}" -gt 0 ]; then
-    return 0
-  fi
-  . "$HY2_STATE" 2>/dev/null || true
-  if [ -n "${PORT:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${PASS:-}" ]; then
-    local up down obfs cert_mode tag
-    up="${UP:-50}"; down="${DOWN:-250}"; obfs="${OBFS:-}"; cert_mode="${CERT_MODE:-cf}"
-    tag="hy2-${PORT}"
-    jq --arg tag "$tag" --argjson port "$PORT" --arg domain "$DOMAIN" --arg auth "$PASS" \
-       --argjson up "$up" --argjson down "$down" --arg obfs "$obfs" --arg cert_mode "$cert_mode" \
-       '. += [{"tag":$tag,"port":$port,"domain":$domain,"auth":$auth,"up":$up,"down":$down,"obfs":$obfs,"cert_mode":$cert_mode}]' \
-       "$HY2_LIST" > "${HY2_LIST}.tmp" && mv "${HY2_LIST}.tmp" "$HY2_LIST"
-    green "已将旧HY2单实例迁移到多实例列表"
-  fi
 }
 hy2_port_exists_in_conf(){
   local p="$1"
@@ -1420,7 +1533,7 @@ configure_hy2_edit(){
   [ -z "$new_up" ] && new_up="$old_up"
   [ -z "$new_down" ] && new_down="$old_down"
   [[ "$new_up" =~ ^[0-9]+$ ]] || new_up=50
-  [[ "$new_down" =~ ^[0-9]+$ ]] || new_down=250
+  [[ "$new_down" =~ ^[0-9]+$ ]] || down=250
 
   local cert_file key_file tag ib
   cert_file="${TLS_DIR_HY2}/${old_domain}.crt"
@@ -1495,7 +1608,7 @@ configure_hy2_reinstall_port(){
   cls
   echo -e "${C_WARN}========== HY2端口重装模式 ==========${C_RST}"
   echo "1) 仅换端口"
-  echo "2) 端口+UUID"
+  echo "2) 更换端口+UUID"
   echo "3) 全新安装"
   echo "0) 取消"
   prompt "请选择: " mode
@@ -1629,13 +1742,12 @@ manage_hy2(){
   install_xray >/dev/null 2>&1 || true
   ensure_dns_rule >/dev/null 2>&1 || true
   init_hy2_list
-  migrate_old_hy2_state || true
 
   while true; do
     cls
     echo -e "${C_WARN}=============== HY2管理 ===============${C_RST}"
     hy2_list_show_table
-    
+
     menu_item_auto "1" "添加HY2实例"
     menu_item_auto "2" "修改HY2实例"
     menu_item_auto "3" "删除HY2实例"
@@ -1659,9 +1771,550 @@ manage_hy2(){
 uninstall_hy2_all(){
   [ -f "$XRAY_CONF" ] || { red "xray未安装"; return 1; }
   update_xray 'del(.inbounds[]? | select(.protocol=="hysteria" or .protocol=="hysteria2" or (.tag|tostring|startswith("hy2-"))))'
-  rm -f "$HY2_STATE" "$HY2_LIST"
+  rm -f "$HY2_LIST"
   svc restart xray
   green "HY2 全部实例已卸载"
+}
+
+# ========== REALITY ==========
+init_reality_list(){
+  mkdir -p "$WORK"
+  [ -f "$REALITY_LIST" ] || echo '[]' > "$REALITY_LIST"
+}
+reality_pick_server_names(){
+  local mode list sn custom
+  cls
+  echo -e "${C_WARN}========== REALITY serverNames ==========${C_RST}"
+  echo "1) 使用推荐域名(可多选)"
+  echo "2) 自定义域名(逗号分隔)"
+  prompt "请选择(默认1): " mode
+  [ -z "$mode" ] && mode=1
+
+  if [ "$mode" = "2" ]; then
+    prompt "输入 serverNames (例: www.microsoft.com,www.cloudflare.com): " custom
+    custom="$(echo "$custom" | tr '[:upper:]' '[:lower:]' | sed 's/ //g; s/^,*//; s/,*$//; s/,,*/,/g')"
+    [ -n "$custom" ] || custom="$REALITY_DEFAULT_SN"
+    echo "$custom"
+    return 0
+  fi
+
+  echo "可选推荐域名："
+  local i=1
+  for sn in "${REALITY_SN_CHOICES[@]}"; do
+    printf "  %2d) %s\n" "$i" "$sn"
+    i=$((i+1))
+  done
+  echo "输入序号(支持 1,3,5)，或 a=全选，回车默认1"
+  prompt "输入: " list
+  [ -z "$list" ] && { echo "${REALITY_SN_CHOICES[0]}"; return 0; }
+
+  if [[ "$list" =~ ^[aA]$ ]]; then
+    printf '%s\n' "${REALITY_SN_CHOICES[@]}" | paste -sd ',' -
+    return 0
+  fi
+
+  local IFS=',' one idx out=""
+  for one in $list; do
+    idx="$(echo "$one" | sed 's/ //g')"
+    [[ "$idx" =~ ^[0-9]+$ ]] || continue
+    [ "$idx" -ge 1 ] && [ "$idx" -le "${#REALITY_SN_CHOICES[@]}" ] || continue
+    out="$(merge_csv "$out" "${REALITY_SN_CHOICES[$((idx-1))]}")"
+  done
+  [ -z "$out" ] && out="${REALITY_SN_CHOICES[0]}"
+  echo "$out"
+}
+reality_gen_keys(){
+  install_xray >/dev/null 2>&1 || true
+  local k
+  k="$("$XRAY_BIN" x25519 2>/dev/null || true)"
+  [ -n "$k" ] || { red "生成REALITY密钥失败"; return 1; }
+  local pri pub
+  pri="$(echo "$k" | awk -F': ' '/Private key/{print $2}')"
+  pub="$(echo "$k" | awk -F': ' '/Public key/{print $2}')"
+  [ -n "$pri" ] && [ -n "$pub" ] || { red "解析REALITY密钥失败"; return 1; }
+  echo "${pri}|${pub}"
+}
+reality_gen_shortids_csv(){
+  local n="${1:-4}" i out="" sid
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    sid="$(openssl rand -hex 8 2>/dev/null || true)"
+    [ -z "$sid" ] && sid="$(rand_alnum 16 | tr '[:upper:]' '[:lower:]' | sed 's/[^0-9a-f]//g')"
+    [ -z "$sid" ] && sid="a1b2c3d4e5f60708"
+    out="$(merge_csv "$out" "$sid")"
+    i=$((i+1))
+  done
+  echo "$out"
+}
+reality_port_exists_in_conf(){
+  local p="$1"
+  jq --argjson p "$p" '[.inbounds[]? | select(.port==$p and .protocol=="vless" and (.streamSettings.security=="reality"))] | length' "$XRAY_CONF" 2>/dev/null | grep -qv '^0$'
+}
+reality_random_free_port(){
+  local old="${1:-0}" p
+  while true; do
+    p=$(( RANDOM % (65000 - 20000 + 1) + 20000 ))
+    [ "$old" -gt 0 ] && [ "$p" -eq "$old" ] && continue
+    if ss -tuln 2>/dev/null | grep -q ":${p} "; then continue; fi
+    if reality_port_exists_in_conf "$p"; then continue; fi
+    echo "$p"; return
+  done
+}
+reality_add_list_entry(){
+  local tag="$1" mode="$2" port="$3" uuid="$4" sni_csv="$5" pbk="$6" sid_csv="$7" fp="$8" flow="$9"
+  init_reality_list
+  jq --arg tag "$tag" --arg mode "$mode" --argjson port "$port" --arg uuid "$uuid" \
+     --arg sni_csv "$sni_csv" --arg pbk "$pbk" --arg sid_csv "$sid_csv" --arg fp "$fp" --arg flow "$flow" \
+     '. += [{"tag":$tag,"mode":$mode,"port":$port,"uuid":$uuid,"sni_csv":$sni_csv,"pbk":$pbk,"sid_csv":$sid_csv,"fp":$fp,"flow":$flow}]' \
+     "$REALITY_LIST" > "${REALITY_LIST}.tmp" && mv "${REALITY_LIST}.tmp" "$REALITY_LIST"
+}
+reality_update_list_by_tag(){
+  local old_tag="$1" new_tag="$2" mode="$3" port="$4" uuid="$5" sni_csv="$6" pbk="$7" sid_csv="$8" fp="$9" flow="${10}"
+  jq --arg old "$old_tag" --arg tag "$new_tag" --arg mode "$mode" --argjson p "$port" --arg uuid "$uuid" \
+     --arg sni_csv "$sni_csv" --arg pbk "$pbk" --arg sid_csv "$sid_csv" --arg fp "$fp" --arg flow "$flow" \
+'map(if .tag==$old then .tag=$tag | .mode=$mode | .port=$p | .uuid=$uuid | .sni_csv=$sni_csv | .pbk=$pbk | .sid_csv=$sid_csv | .fp=$fp | .flow=$flow else . end)' \
+     "$REALITY_LIST" > "${REALITY_LIST}.tmp" && mv "${REALITY_LIST}.tmp" "$REALITY_LIST"
+}
+reality_del_by_tag(){
+  local tag="$1"
+  update_xray --arg tag "$tag" 'del(.inbounds[]? | select(.tag==$tag))'
+  init_reality_list
+  jq --arg tag "$tag" 'map(select(.tag != $tag))' "$REALITY_LIST" > "${REALITY_LIST}.tmp" && mv "${REALITY_LIST}.tmp" "$REALITY_LIST"
+}
+reality_build_inbound_json(){
+  local tag="$1" mode="$2" port="$3" uuid="$4" sni_csv="$5" pri="$6" sid_csv="$7" fp="$8"
+
+  local sni_json sid_json
+  sni_json="$(csv_to_json_unique "$sni_csv")"
+  sid_json="$(csv_to_json_unique "$sid_csv")"
+
+  if [ "$mode" = "vision" ]; then
+    jq -nc \
+      --arg tag "$tag" --argjson p "$port" --arg uuid "$uuid" --arg pri "$pri" --arg fp "$fp" \
+      --argjson sns "$sni_json" --argjson sids "$sid_json" \
+'{
+  "tag":$tag,
+  "listen":"0.0.0.0",
+  "port":$p,
+  "protocol":"vless",
+  "settings":{
+    "clients":[{"id":$uuid,"flow":"xtls-rprx-vision"}],
+    "decryption":"none"
+  },
+  "streamSettings":{
+    "network":"tcp",
+    "security":"reality",
+    "realitySettings":{
+      "show":false,
+      "dest":"'"${REALITY_DEFAULT_SN}"':443",
+      "xver":0,
+      "serverNames":$sns,
+      "privateKey":$pri,
+      "shortIds":$sids
+    }
+  },
+  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+}'
+  else
+    jq -nc \
+      --arg tag "$tag" --argjson p "$port" --arg uuid "$uuid" --arg pri "$pri" --arg fp "$fp" \
+      --argjson sns "$sni_json" --argjson sids "$sid_json" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" \
+'{
+  "tag":$tag,
+  "listen":"0.0.0.0",
+  "port":$p,
+  "protocol":"vless",
+  "settings":{"clients":[{"id":$uuid}],"decryption":"none"},
+  "streamSettings":{
+    "network":"xhttp",
+    "security":"reality",
+    "realitySettings":{
+      "show":false,
+      "dest":"'"${REALITY_DEFAULT_SN}"':443",
+      "xver":0,
+      "serverNames":$sns,
+      "privateKey":$pri,
+      "shortIds":$sids
+    },
+    "xhttpSettings":{
+      "host":"",
+      "path":"/rx",
+      "mode":$mode,
+      "extra":$extra
+    }
+  },
+  "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+}'
+  fi
+}
+reality_list_show_table(){
+  init_reality_list
+  local list
+  list="$(jq -c '.[]' "$REALITY_LIST" 2>/dev/null || true)"
+  if [ -z "$list" ]; then
+    echo -e "当前: ${C_BAD}未配置${C_RST}"
+    return
+  fi
+  echo "--------------------------------------------------"
+  echo " 序号 | 类型     | 端口"
+  echo "--------------------------------------------------"
+  local i=1
+  while IFS= read -r one; do
+    [ -z "$one" ] && continue
+    local mode p
+    mode="$(echo "$one" | jq -r '.mode')"
+    p="$(echo "$one" | jq -r '.port')"
+    [ "$mode" = "vision" ] && mode="Vision" || mode="XHTTP"
+    printf " %-4s| %-8s | %s\n" "$i" "$mode" "$p"
+    i=$((i+1))
+  done <<< "$list"
+}
+reality_pick_by_index(){
+  local idx="$1"
+  init_reality_list
+  jq -c ".[$((idx-1))] // empty" "$REALITY_LIST" 2>/dev/null || true
+}
+
+configure_reality_add(){
+  install_xray || return 1
+  ensure_dns_rule || return 1
+  init_reality_list
+
+  local mode p uuid sni_csv keys pri pub sid_csv fp tag ib
+  cls
+  echo -e "${C_WARN}========== 添加 REALITY 入站 ==========${C_RST}"
+  echo "1) VLESS-Vision-REALITY"
+  echo "2) VLESS-XHTTP-REALITY"
+  prompt "选择(默认1): " mode
+  [ -z "$mode" ] && mode=1
+  case "$mode" in
+    1) mode="vision" ;;
+    2) mode="xhttp" ;;
+    *) red "无效"; return 1 ;;
+  esac
+
+  prompt "端口(20000-65000，回车随机): " p
+  if [ -z "$p" ]; then
+    p="$(reality_random_free_port 0)"
+  else
+    [[ "$p" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+    [ "$p" -ge 20000 ] && [ "$p" -le 65000 ] || { red "端口越界"; return 1; }
+    reality_port_exists_in_conf "$p" && { red "端口已存在REALITY入站"; return 1; }
+  fi
+  if ss -tuln 2>/dev/null | grep -q ":${p} "; then
+    yellow "警告：系统检测该端口可能被占用"
+  fi
+
+  prompt "UUID(回车随机): " uuid
+  [ -z "$uuid" ] && uuid="$(gen_uuid)"
+
+  sni_csv="$(reality_pick_server_names)"
+  [ -n "$sni_csv" ] || sni_csv="$REALITY_DEFAULT_SN"
+
+  prompt "fingerprint(默认 chrome): " fp
+  [ -z "$fp" ] && fp="chrome"
+
+  prompt "shortIds(逗号分隔，回车自动随机4个): " sid_csv
+  [ -z "$sid_csv" ] && sid_csv="$(reality_gen_shortids_csv 4)"
+  sid_csv="$(echo "$sid_csv" | tr '[:upper:]' '[:lower:]' | sed 's/ //g; s/^,*//; s/,*$//; s/,,*/,/g')"
+  [ -n "$sid_csv" ] || sid_csv="$(reality_gen_shortids_csv 4)"
+
+  keys="$(reality_gen_keys)" || return 1
+  pri="${keys%%|*}"; pub="${keys#*|}"
+
+  tag="reality-${mode}-${p}"
+  ib="$(reality_build_inbound_json "$tag" "$mode" "$p" "$uuid" "$sni_csv" "$pri" "$sid_csv" "$fp")"
+  update_xray --argjson ib "$ib" '.inbounds += [$ib]'
+
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_reality_add_check.log 2>&1; then
+    red "Xray 配置校验失败"
+    tail -n 80 /tmp/xray_reality_add_check.log 2>/dev/null || true
+    update_xray --arg tag "$tag" 'del(.inbounds[]? | select(.tag==$tag))'
+    return 1
+  fi
+
+  open_port "$p" tcp || yellow "请手动放行 ${p}/tcp"
+  reality_add_list_entry "$tag" "$mode" "$p" "$uuid" "$sni_csv" "$pub" "$sid_csv" "$fp" "$( [ "$mode" = "vision" ] && echo "xtls-rprx-vision" || echo "" )"
+  svc restart xray
+  green "REALITY 入站添加成功: ${tag}"
+}
+
+configure_reality_edit(){
+  init_reality_list
+  local cnt; cnt="$(jq 'length' "$REALITY_LIST" 2>/dev/null || echo 0)"
+  [ "${cnt:-0}" -gt 0 ] || { red "无可修改REALITY实例"; return 1; }
+
+  reality_list_show_table
+  local idx one tag mode p uuid sni_csv sid_csv fp flow pbk
+  prompt "选择序号(0取消): " idx
+  [[ "$idx" =~ ^[0-9]+$ ]] || { red "输入无效"; return 1; }
+  [ "$idx" -eq 0 ] && return 0
+  [ "$idx" -ge 1 ] && [ "$idx" -le "$cnt" ] || { red "序号越界"; return 1; }
+
+  one="$(reality_pick_by_index "$idx")"
+  [ -n "$one" ] || { red "读取失败"; return 1; }
+
+  tag="$(echo "$one" | jq -r '.tag')"
+  mode="$(echo "$one" | jq -r '.mode')"
+  p="$(echo "$one" | jq -r '.port')"
+  uuid="$(echo "$one" | jq -r '.uuid')"
+  sni_csv="$(echo "$one" | jq -r '.sni_csv')"
+  sid_csv="$(echo "$one" | jq -r '.sid_csv')"
+  fp="$(echo "$one" | jq -r '.fp')"
+  flow="$(echo "$one" | jq -r '.flow')"
+  pbk="$(echo "$one" | jq -r '.pbk')"
+
+  local nu nsid nfp nkeys npri npbk ask_sni
+  green "当前 tag=$tag mode=$mode 端口=$p"
+  prompt "新UUID(留空不变): " nu
+  [ -z "$nu" ] && nu="$uuid"
+
+  prompt "是否重新选择 serverNames? (y/N): " ask_sni
+  case "${ask_sni,,}" in
+    y|yes) sni_csv="$(reality_pick_server_names)" ;;
+  esac
+  [ -n "$sni_csv" ] || sni_csv="$REALITY_DEFAULT_SN"
+
+  prompt "新shortIds(逗号分隔，留空不变，输入 regen=随机重置): " nsid
+  if [ "$nsid" = "regen" ]; then
+    sid_csv="$(reality_gen_shortids_csv 4)"
+  elif [ -n "$nsid" ]; then
+    sid_csv="$(echo "$nsid" | tr '[:upper:]' '[:lower:]' | sed 's/ //g; s/^,*//; s/,*$//; s/,,*/,/g')"
+  fi
+  [ -n "$sid_csv" ] || sid_csv="$(reality_gen_shortids_csv 4)"
+
+  prompt "新fingerprint(留空不变): " nfp
+  [ -z "$nfp" ] && nfp="$fp"
+
+  prompt "是否重置REALITY密钥? (y/N): " rg
+  if [[ "${rg,,}" =~ ^(y|yes)$ ]]; then
+    nkeys="$(reality_gen_keys)" || return 1
+    npri="${nkeys%%|*}"
+    npbk="${nkeys#*|}"
+  else
+    # 不重置密钥时，只能保留原公钥展示；私钥从现有入站读取
+    npri="$(jq -r --arg tag "$tag" 'first(.inbounds[]? | select(.tag==$tag) | .streamSettings.realitySettings.privateKey) // empty' "$XRAY_CONF" 2>/dev/null || true)"
+    [ -n "$npri" ] || { red "读取原私钥失败，请选择重置密钥"; return 1; }
+    npbk="$pbk"
+  fi
+
+  local ib
+  ib="$(reality_build_inbound_json "$tag" "$mode" "$p" "$nu" "$sni_csv" "$npri" "$sid_csv" "$nfp")"
+
+  update_xray --arg tag "$tag" 'del(.inbounds[]? | select(.tag==$tag))'
+  update_xray --argjson ib "$ib" '.inbounds += [$ib]'
+
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_reality_edit_check.log 2>&1; then
+    red "配置校验失败，修改未生效"
+    tail -n 80 /tmp/xray_reality_edit_check.log 2>/dev/null || true
+    return 1
+  fi
+
+  reality_update_list_by_tag "$tag" "$tag" "$mode" "$p" "$nu" "$sni_csv" "$npbk" "$sid_csv" "$nfp" "$flow"
+  svc restart xray
+  green "REALITY 修改成功"
+}
+
+configure_reality_delete(){
+  init_reality_list
+  local cnt; cnt="$(jq 'length' "$REALITY_LIST" 2>/dev/null || echo 0)"
+  [ "${cnt:-0}" -gt 0 ] || { red "无可删除REALITY实例"; return 1; }
+
+  reality_list_show_table
+  local idx one tag
+  prompt "选择序号删除(0取消): " idx
+  [[ "$idx" =~ ^[0-9]+$ ]] || { red "输入无效"; return 1; }
+  [ "$idx" -eq 0 ] && return 0
+  [ "$idx" -ge 1 ] && [ "$idx" -le "$cnt" ] || { red "序号越界"; return 1; }
+
+  one="$(reality_pick_by_index "$idx")"
+  tag="$(echo "$one" | jq -r '.tag')"
+  [ -n "$tag" ] || { red "读取失败"; return 1; }
+
+  reality_del_by_tag "$tag"
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_reality_del_check.log 2>&1; then
+    red "配置校验失败，删除可能未生效"
+    tail -n 60 /tmp/xray_reality_del_check.log 2>/dev/null || true
+    return 1
+  fi
+  svc restart xray
+  green "已删除REALITY实例: $tag"
+}
+
+configure_reality_reinstall_port(){
+  init_reality_list
+  local cnt; cnt="$(jq 'length' "$REALITY_LIST" 2>/dev/null || echo 0)"
+  [ "${cnt:-0}" -gt 0 ] || { red "无可重装REALITY实例"; return 1; }
+
+  reality_list_show_table
+  local idx one tag mode oldp uuid sni_csv sid_csv fp flow pbk
+  prompt "选择序号(0取消): " idx
+  [[ "$idx" =~ ^[0-9]+$ ]] || { red "输入无效"; return 1; }
+  [ "$idx" -eq 0 ] && return 0
+  [ "$idx" -ge 1 ] && [ "$idx" -le "$cnt" ] || { red "序号越界"; return 1; }
+
+  one="$(reality_pick_by_index "$idx")"
+  tag="$(echo "$one" | jq -r '.tag')"
+  mode="$(echo "$one" | jq -r '.mode')"
+  oldp="$(echo "$one" | jq -r '.port')"
+  uuid="$(echo "$one" | jq -r '.uuid')"
+  sni_csv="$(echo "$one" | jq -r '.sni_csv')"
+  sid_csv="$(echo "$one" | jq -r '.sid_csv')"
+  fp="$(echo "$one" | jq -r '.fp')"
+  flow="$(echo "$one" | jq -r '.flow')"
+  pbk="$(echo "$one" | jq -r '.pbk')"
+
+  cls
+  echo -e "${C_WARN}========== REALITY端口重装 ==========${C_RST}"
+  echo "1) 仅换端口"
+  echo "2) 更换端口+UUID"
+  echo "3) 全新安装"
+  echo "0) 取消"
+  prompt "请选择: " m
+  case "$m" in
+    0) return 0 ;;
+    1|2|3) ;;
+    *) red "无效"; return 1 ;;
+  esac
+
+  local np pm
+  echo "新端口方式: 1.随机 2.手动"
+  prompt "选择(默认1): " pm
+  [ -z "$pm" ] && pm=1
+  case "$pm" in
+    2)
+      prompt "输入新端口(20000-65000): " np
+      [[ "$np" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+      [ "$np" -ge 20000 ] && [ "$np" -le 65000 ] || { red "端口越界"; return 1; }
+      [ "$np" -ne "$oldp" ] || { red "新端口不能与旧端口相同"; return 1; }
+      reality_port_exists_in_conf "$np" && { red "端口已被REALITY占用"; return 1; }
+      ;;
+    *)
+      np="$(reality_random_free_port "$oldp")"
+      ;;
+  esac
+
+  local ntag npri npbk keys ib ask_sni
+  ntag="reality-${mode}-${np}"
+
+  if [ "$m" = "2" ]; then
+    uuid="$(gen_uuid)"
+  elif [ "$m" = "3" ]; then
+    prompt "UUID(回车随机): " nu
+    [ -n "$nu" ] && uuid="$nu" || uuid="$(gen_uuid)"
+    sni_csv="$(reality_pick_server_names)"
+    prompt "fingerprint(默认 chrome): " nfp
+    [ -n "$nfp" ] && fp="$nfp" || fp="chrome"
+    prompt "shortIds(逗号分隔，回车随机): " nsid
+    if [ -z "$nsid" ]; then sid_csv="$(reality_gen_shortids_csv 4)"
+    else sid_csv="$(echo "$nsid" | tr '[:upper:]' '[:lower:]' | sed 's/ //g; s/^,*//; s/,*$//; s/,,*/,/g')"; fi
+    [ -n "$sid_csv" ] || sid_csv="$(reality_gen_shortids_csv 4)"
+    keys="$(reality_gen_keys)" || return 1
+    npri="${keys%%|*}"; npbk="${keys#*|}"
+  fi
+
+  if [ "$m" != "3" ]; then
+    prompt "是否重新选择 serverNames? (y/N): " ask_sni
+    case "${ask_sni,,}" in y|yes) sni_csv="$(reality_pick_server_names)" ;; esac
+    npri="$(jq -r --arg tag "$tag" 'first(.inbounds[]? | select(.tag==$tag) | .streamSettings.realitySettings.privateKey) // empty' "$XRAY_CONF" 2>/dev/null || true)"
+    [ -n "$npri" ] || { red "读取旧私钥失败"; return 1; }
+    npbk="$pbk"
+  fi
+
+  ib="$(reality_build_inbound_json "$ntag" "$mode" "$np" "$uuid" "$sni_csv" "$npri" "$sid_csv" "$fp")"
+
+  update_xray --arg tag "$tag" 'del(.inbounds[]? | select(.tag==$tag))'
+  update_xray --argjson ib "$ib" '.inbounds += [$ib]'
+
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_reality_reinstall_check.log 2>&1; then
+    red "配置校验失败"
+    tail -n 80 /tmp/xray_reality_reinstall_check.log 2>/dev/null || true
+    return 1
+  fi
+
+  open_port "$np" tcp || yellow "请手动放行 ${np}/tcp"
+  reality_update_list_by_tag "$tag" "$ntag" "$mode" "$np" "$uuid" "$sni_csv" "$npbk" "$sid_csv" "$fp" "$flow"
+  svc restart xray
+  green "REALITY重装成功：${oldp} -> ${np}"
+}
+
+show_reality_links_only(){
+  cls
+  init_reality_list
+  [ "$IP_CHECKED" = "1" ] || load_ip_cache >/dev/null 2>&1 || true
+  [ "$IP_CHECKED" = "1" ] || check_ip || true
+  local ip cnt list
+  ip="$(pick_node_host)"; [ -n "$ip" ] || ip=""
+  [ -z "$BASE_FULL" ] && BASE_FULL="Node"
+
+  cnt="$(jq 'length' "$REALITY_LIST" 2>/dev/null || echo 0)"
+  [ "${cnt:-0}" -gt 0 ] || { red "暂无REALITY实例"; return; }
+
+  green "============= REALITY链接 ============="
+  list="$(jq -c '.[]' "$REALITY_LIST")"
+  while IFS= read -r one; do
+    [ -z "$one" ] && continue
+    local mode p uuid sni_csv pbk sid_csv fp flow first_sni sid name link
+    mode="$(echo "$one" | jq -r '.mode')"
+    p="$(echo "$one" | jq -r '.port')"
+    uuid="$(echo "$one" | jq -r '.uuid')"
+    sni_csv="$(echo "$one" | jq -r '.sni_csv')"
+    pbk="$(echo "$one" | jq -r '.pbk')"
+    sid_csv="$(echo "$one" | jq -r '.sid_csv')"
+    fp="$(echo "$one" | jq -r '.fp')"
+    flow="$(echo "$one" | jq -r '.flow')"
+
+    first_sni="$(echo "$sni_csv" | cut -d',' -f1)"
+    sid="$(echo "$sid_csv" | cut -d',' -f1)"
+    [ -z "$fp" ] && fp="chrome"
+
+    if [ "$mode" = "vision" ]; then
+      name="${BASE_FULL} - VLESS-Vision-REALITY-${p}"
+      link="vless://${uuid}@${ip}:${p}?encryption=none&security=reality&sni=${first_sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&flow=xtls-rprx-vision&type=tcp#$(url_encode "$name")"
+    else
+      name="${BASE_FULL} - VLESS-XHTTP-REALITY-${p}"
+      link="vless://${uuid}@${ip}:${p}?encryption=none&security=reality&sni=${first_sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=xhttp&path=%2Frx&mode=${XHTTP_MODE}&extra=$(url_encode "$XHTTP_EXTRA_JSON")#$(url_encode "$name")"
+    fi
+    purple "$link"; echo
+  done <<< "$list"
+  echo "======================================="
+}
+
+manage_reality(){
+  install_xray >/dev/null 2>&1 || true
+  ensure_dns_rule >/dev/null 2>&1 || true
+  init_reality_list
+
+  while true; do
+    cls
+    echo -e "${C_WARN}============= REALITY管理 =============${C_RST}"
+    reality_list_show_table
+    echo "---------------------------------------"
+    menu_item_auto "1" "添加REALITY实例"
+    menu_item_auto "2" "修改REALITY实例"
+    menu_item_auto "3" "删除REALITY实例"
+    menu_item_auto "4" "重装随机端口"
+    menu_item_auto "5" "查看REALITY链接"
+    menu_item_auto "0" "返回"
+    echo "======================================="
+    prompt "请选择: " c
+    case "$c" in
+      1) configure_reality_add; pause ;;
+      2) configure_reality_edit; pause ;;
+      3) configure_reality_delete; pause ;;
+      4) configure_reality_reinstall_port; pause ;;
+      5) show_reality_links_only; pause ;;
+      0) return ;;
+      *) red "无效"; pause ;;
+    esac
+  done
+}
+uninstall_reality_all(){
+  [ -f "$XRAY_CONF" ] || { red "xray未安装"; return 1; }
+  update_xray 'del(.inbounds[]? | select(.protocol=="vless" and .streamSettings.security=="reality"))'
+  rm -f "$REALITY_LIST"
+  svc restart xray
+  green "REALITY 全部实例已卸载"
 }
 
 # ========== Nodes ==========
@@ -1692,8 +2345,8 @@ show_xray_nodes(){
       m="$(echo "$ssib" | jq -r '.settings.method')"; pw="$(echo "$ssib" | jq -r '.settings.password')"
       b64="$(echo -n "${m}:${pw}" | base64 | tr -d '\n')"
       local ss_plugin
-ss_plugin="$(url_encode "v2ray-plugin;mode=websocket;host=${d};path=/ssgo;mux=0")"
-purple "ss://${b64}@${SS_FIXED_IP}:2052?plugin=${ss_plugin}#$(url_encode "$ns")"; echo
+      ss_plugin="$(url_encode "v2ray-plugin;mode=websocket;host=${d};path=/ssgo;mux=0")"
+      purple "ss://${b64}@${SS_FIXED_IP}:2052?plugin=${ss_plugin}#$(url_encode "$ns")"; echo
       cnt=$((cnt+1))
     fi
   fi
@@ -1713,8 +2366,8 @@ purple "ss://${b64}@${SS_FIXED_IP}:2052?plugin=${ss_plugin}#$(url_encode "$ns")"
       m="$(echo "$ssib" | jq -r '.settings.method')"; pw="$(echo "$ssib" | jq -r '.settings.password')"
       b64="$(echo -n "${m}:${pw}" | base64 | tr -d '\n')"
       local ss_plugin
-ss_plugin="$(url_encode "v2ray-plugin;mode=websocket;host=${d};path=/ssgo;mux=0")"
-purple "ss://${b64}@${SS_FIXED_IP}:2052?plugin=${ss_plugin}#$(url_encode "$ns")"; echo
+      ss_plugin="$(url_encode "v2ray-plugin;mode=websocket;host=${d};path=/ssgo;mux=0")"
+      purple "ss://${b64}@${SS_FIXED_IP}:2052?plugin=${ss_plugin}#$(url_encode "$ns")"; echo
       cnt=$((cnt+1))
     fi
   fi
@@ -1761,10 +2414,37 @@ purple "ss://${b64}@${SS_FIXED_IP}:2052?plugin=${ss_plugin}#$(url_encode "$ns")"
     done <<< "$list"
   fi
 
+  init_reality_list
+  if [ -f "$REALITY_LIST" ] && [ "$(jq 'length' "$REALITY_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then
+    local rlist
+    rlist="$(jq -c '.[]' "$REALITY_LIST" 2>/dev/null || true)"
+    while IFS= read -r one; do
+      [ -z "$one" ] && continue
+      local mode p ru sni_csv pbk sid_csv fp sid first_sni rn
+      mode="$(echo "$one" | jq -r '.mode')"
+      p="$(echo "$one" | jq -r '.port')"
+      ru="$(echo "$one" | jq -r '.uuid')"
+      sni_csv="$(echo "$one" | jq -r '.sni_csv')"
+      pbk="$(echo "$one" | jq -r '.pbk')"
+      sid_csv="$(echo "$one" | jq -r '.sid_csv')"
+      fp="$(echo "$one" | jq -r '.fp')"
+      first_sni="$(echo "$sni_csv" | cut -d',' -f1)"
+      sid="$(echo "$sid_csv" | cut -d',' -f1)"
+      [ -z "$fp" ] && fp="chrome"
+      if [ "$mode" = "vision" ]; then
+        rn="${BASE_FULL} - VLESS-Vision-REALITY-${p}"
+        purple "vless://${ru}@${ip}:${p}?encryption=none&security=reality&sni=${first_sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&flow=xtls-rprx-vision&type=tcp#$(url_encode "$rn")"; echo
+      else
+        rn="${BASE_FULL} - VLESS-XHTTP-REALITY-${p}"
+        purple "vless://${ru}@${ip}:${p}?encryption=none&security=reality&sni=${first_sni}&fp=${fp}&pbk=${pbk}&sid=${sid}&type=xhttp&path=%2Frx&mode=${XHTTP_MODE}&extra=$(url_encode "$XHTTP_EXTRA_JSON")#$(url_encode "$rn")"; echo
+      fi
+      cnt=$((cnt+1))
+    done <<< "$rlist"
+  fi
+
   [ "$cnt" -eq 0 ] && yellow "暂无配置节点"
   echo "=========================================="
 }
-
 # ========== Socks5 ==========
 manage_socks5(){
   if [ ! -f "$XRAY_CONF" ]; then
@@ -2316,6 +2996,9 @@ full_uninstall(){
   pkill -x xray >/dev/null 2>&1 || true
   rm -f /etc/init.d/tunnel-argo /etc/systemd/system/tunnel-argo.service
   rm -f /etc/init.d/xray /etc/systemd/system/xray.service
+  geodata_disable_systemd_timer || true
+  geodata_disable_cron || true
+  rm -f "$GEODATA_SCRIPT" "$GEODATA_CONF" "$GEODATA_LOG"
   command -v systemctl >/dev/null 2>&1 && {
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed >/dev/null 2>&1 || true
@@ -2325,7 +3008,7 @@ full_uninstall(){
   swap_disable_all >/dev/null 2>&1 || true
   rm -f /usr/local/bin/xray
   rm -rf "$WORK"
-  green "已彻底卸载（服务/配置/快捷方式/监控/SWAP 已清理）"
+  green "已彻底卸载（服务/配置/快捷方式/监控/SWAP/Geodata 已清理）"
 }
 
 # ========== Outbound menu ==========
@@ -2409,20 +3092,23 @@ manage_outbound_menu(){
     esac
   done
 }
+
 # ========== Xray menu ==========
 xray_menu(){
   while true; do
     cls
     load_cf_mode
-    local xs as hs cm
+    local xs as hs rs cm
     if [ -x "$XRAY_BIN" ]; then xs=$(is_running xray && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else xs="${C_BAD}未安装${C_RST}"; fi
     if service_exists tunnel-argo; then as=$(is_running tunnel-argo && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else as="${C_BAD}未配置${C_RST}"; fi
     init_hy2_list
     if [ "$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then hs="\033[1;36m已配置\033[0m"; else hs="${C_BAD}未配置${C_RST}"; fi
+    init_reality_list
+    if [ "$(jq 'length' "$REALITY_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then rs="\033[1;36m已配置\033[0m"; else rs="${C_BAD}未配置${C_RST}"; fi
     cm="$( [ "$CF_MODE" = "origin" ] && echo "端口回源" || echo "Argo隧道" )"
 
     echo -e "${C_OK}=============== Xray管理 ===============${C_RST}"
-    echo -e "Xray: ${xs}   Argo: ${as}   HY2: ${hs}"
+    echo -e "Xray: ${xs}   Argo: ${as}   HY2: ${hs}   REALITY: ${rs}"
     echo -e "CF加速模式: \033[1;36m${cm}\033[0m"
     echo "-----------------------------------------------"
     menu_row2_auto "1"  "配置CF加速"         "8"  "实时日志"
@@ -2431,8 +3117,10 @@ xray_menu(){
     menu_row2_auto "4"  "重启Argo"           "0"  "返回"
     menu_row2_auto "5"  "重启Xray"
     menu_row2_auto "6"  "卸载Argo"
+    menu_row2_auto "7"  "配置REALITY"
     menu_row2_auto "11" "卸载Xray"
     menu_row2_auto "12" "更新Xray"
+    menu_row2_auto "13" "Geodata更新"
     echo "==============================================="
     prompt "请选择: " c
     case "$c" in
@@ -2442,11 +3130,13 @@ xray_menu(){
       4) service_exists tunnel-argo && svc restart tunnel-argo && green "Argo 已重启" || red "Argo未安装"; pause ;;
       5) service_exists xray && svc restart xray && green "Xray 已重启" || red "Xray未安装"; pause ;;
       6) uninstall_argo; pause ;;
+      7) manage_reality ;;
       8) foreground_xray_log ;;
       9) show_xray_nodes; pause ;;
       10) prompt "新UUID(回车自动): " u; [ -z "$u" ] && u="$(gen_uuid)"; set_xray_uuid "$u"; pause ;;
       11) uninstall_xray_only; pause ;;
       12) update_xray_core; pause ;;
+      13) manage_geodata_menu ;;
       0) return ;;
       *) red "无效"; pause ;;
     esac
@@ -2466,7 +3156,7 @@ detect_virt_name(){
       lxc) echo "LXC"; return ;;
       containerd) echo "CONTAINERD"; return ;;
       openvz|kvm|qemu|vmware|xen) echo "${v^^}"; return ;;
-      container) ;;   # 继续细分，不直接返回
+      container) ;;
       none|"") ;;
       *) echo "${v^^}"; return ;;
     esac
@@ -2584,7 +3274,8 @@ main_menu(){
   mkdir -p "$WORK"
   load_state
   init_hy2_list
-  migrate_old_hy2_state || true
+  init_reality_list
+  geodata_apply_schedule || true
 
   load_ip_cache >/dev/null 2>&1 || true
   [ "$IP_CHECKED" = "1" ] || {
@@ -2625,18 +3316,20 @@ main_menu(){
     echo "-----------------------------------------------"
     echo -e "IPv4 : ${u4}"
     echo -e "IPv6 : ${u6}"
+    echo -e "Geodata自动更新: \033[1;36m$(geodata_status_str)\033[0m"
     echo -e "${C_DIM}==========================================${C_RST}"
     echo
     menu_row2_auto "1" "管理Xray"   "6" "管理SWAP"
     menu_row2_auto "2" "管理出站"   "8" "创建快捷"
     menu_row2_auto "3" "服务监控"   "9" "彻底卸载"
-    menu_row2_auto "0" "退出"
+    menu_row2_auto "4" "管理Geodata" "0" "退出"
     echo "==============================================="
     prompt "请选择: " c
     case "$c" in
       1) xray_menu ;;
       2) manage_outbound_menu ;;
       3) manage_service_monitor ;;
+      4) manage_geodata_menu ;;
       0) cls; exit 0 ;;
       6) manage_swap ;;
       8) install_shortcut; pause ;;
