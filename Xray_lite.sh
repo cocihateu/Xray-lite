@@ -100,6 +100,14 @@ ARGO_DOMAIN="${WORK}/domain_argo.txt"
 ARGO_YML="${WORK}/tunnel_argo.yml"
 ARGO_JSON="${WORK}/tunnel_argo.json"
 
+# CF加速模式: argo | origin
+# origin 模式使用固定回源端口
+CF_MODE_CONF="${WORK}/cf_mode.conf"
+CF_MODE="argo"
+ORIGIN_VLESS_WS_PORT=62481
+ORIGIN_VLESS_XHTTP_PORT=62482
+ORIGIN_SS_WS_PORT=62483
+
 RESTART_CONF="${WORK}/restart.conf"
 OUTBOUND_CONF="${WORK}/outbound_policy.conf"
 IPCACHE="${WORK}/ip_cache.conf"
@@ -273,14 +281,11 @@ ensure_acme(){
 }
 
 detect_ssh_ports(){
-  # 输出多行端口号
   {
     echo 22
-    # 当前SSH会话端口（SSH_CONNECTION第4列是服务端端口）
     if [ -n "${SSH_CONNECTION:-}" ]; then
       echo "$SSH_CONNECTION" | awk '{print $4}'
     fi
-    # sshd_config 里的 Port
     if [ -f /etc/ssh/sshd_config ]; then
       awk '/^[[:space:]]*Port[[:space:]]+[0-9]+([[:space:]]|$)/{print $2}' /etc/ssh/sshd_config
     fi
@@ -306,7 +311,6 @@ protect_ssh_firewalld(){
 open_port(){
   local p="$1" proto="${2:-tcp}"
 
-  # 1) 已启用 UFW -> 用 UFW
   if command -v ufw >/dev/null 2>&1; then
     if ufw status 2>/dev/null | grep -qi '^Status: active'; then
       ufw allow "${p}/${proto}" >/dev/null 2>&1 && {
@@ -316,7 +320,6 @@ open_port(){
     fi
   fi
 
-  # 2) 已运行 firewalld -> 用 firewalld
   if command -v firewall-cmd >/dev/null 2>&1; then
     if firewall-cmd --state 2>/dev/null | grep -qi '^running$'; then
       firewall-cmd --add-port="${p}/${proto}" --permanent >/dev/null 2>&1 || true
@@ -328,7 +331,6 @@ open_port(){
     fi
   fi
 
-  # 3) 都没启用时：可选自动启用 UFW（先保护 SSH）
   if command -v ufw >/dev/null 2>&1; then
     if ufw status 2>/dev/null | grep -qi '^Status: inactive'; then
       protect_ssh_ufw
@@ -341,7 +343,6 @@ open_port(){
     fi
   fi
 
-  # 4) 都没启用时：可选自动启用 firewalld（先保护 SSH）
   if command -v firewall-cmd >/dev/null 2>&1; then
     if ! firewall-cmd --state >/dev/null 2>&1; then
       if command -v systemctl >/dev/null 2>&1; then
@@ -362,7 +363,6 @@ open_port(){
     fi
   fi
 
-  # 5) fallback：nftables 优先
   if command -v nft >/dev/null 2>&1; then
     if nft list chain inet filter input >/dev/null 2>&1; then
       nft list chain inet filter input 2>/dev/null | grep -Eq "\\b${proto}\\s+dport\\s+${p}\\b.*\\baccept\\b" || \
@@ -375,7 +375,6 @@ open_port(){
     fi
   fi
 
-  # 6) fallback：iptables
   if command -v iptables >/dev/null 2>&1; then
     local ok4=1 ok6=1
     iptables -C INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 || \
@@ -397,6 +396,22 @@ open_port(){
 }
 
 # ========== State ==========
+load_cf_mode(){
+  if [ -f "$CF_MODE_CONF" ]; then
+    CF_MODE="$(awk -F= '/^CF_MODE=/{print $2}' "$CF_MODE_CONF" 2>/dev/null || echo "argo")"
+  fi
+  case "$CF_MODE" in
+    argo|origin) ;;
+    *) CF_MODE="argo" ;;
+  esac
+}
+save_cf_mode(){
+  mkdir -p "$WORK"
+  cat > "$CF_MODE_CONF" <<EOF
+CF_MODE=${CF_MODE}
+EOF
+}
+
 load_state(){
   if [ -f "$RESTART_CONF" ]; then
     RESTART_HOURS="$(cat "$RESTART_CONF" 2>/dev/null || echo 0)"
@@ -407,6 +422,7 @@ load_state(){
     [[ "$YOUTUBE_MODE" =~ ^[12]$ ]] || YOUTUBE_MODE=1
     V6_SITES="$(awk -F= '/^V6_SITES=/{print $2}' "$OUTBOUND_CONF" 2>/dev/null)"
   fi
+  load_cf_mode
 }
 save_outbound(){
   mkdir -p "$WORK"
@@ -665,7 +681,7 @@ uninstall_xray_only(){
     2)
       svc stop xray; svc disable xray
       rm -f /etc/init.d/xray /etc/systemd/system/xray.service
-      rm -f "$XRAY_BIN" "$XRAY_CONF" "$HY2_STATE" "$HY2_LIST"
+      rm -f "$XRAY_BIN" "$XRAY_CONF" "$HY2_STATE" "$HY2_LIST" "$CF_MODE_CONF"
       command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
       green "Xray已完全卸载"
       ;;
@@ -701,25 +717,23 @@ apply_policy_xray(){
   local v6_domains
   v6_domains="$(build_v6_domains_json)"
   if [ "$(echo "$v6_domains" | jq 'length')" -gt 0 ]; then
-  # 1) 先拦IPv4（严格）
-  update_xray --argjson d "$v6_domains" \
-    '.routing.rules += [{
-      "type":"field",
-      "domain":($d|map("domain:"+.)),
-      "ip":["0.0.0.0/0"],
-      "outboundTag":"block-v4",
-      "tag":"v6-strict-reject-rule"
-    }]'
+    update_xray --argjson d "$v6_domains" \
+      '.routing.rules += [{
+        "type":"field",
+        "domain":($d|map("domain:"+.)),
+        "ip":["0.0.0.0/0"],
+        "outboundTag":"block-v4",
+        "tag":"v6-strict-reject-rule"
+      }]'
 
-  # 2) 再走IPv6
-  update_xray --argjson d "$v6_domains" \
-    '.routing.rules += [{
-      "type":"field",
-      "domain":($d|map("domain:"+.)),
-      "outboundTag":"direct-v6",
-      "tag":"v6-strict-route-rule"
-    }]'
-fi
+    update_xray --argjson d "$v6_domains" \
+      '.routing.rules += [{
+        "type":"field",
+        "domain":($d|map("domain:"+.)),
+        "outboundTag":"direct-v6",
+        "tag":"v6-strict-route-rule"
+      }]'
+  fi
   if [ "$YOUTUBE_MODE" = "2" ]; then
     if ensure_geosite; then
       update_xray '.routing.rules += [{"type":"field","domain":["geosite:youtube"],"ip":["0.0.0.0/0"],"outboundTag":"block-v4","tag":"v6-geosite-strict-reject-rule"}]'
@@ -748,6 +762,68 @@ ask_enable_youtube_strict(){
   save_outbound; apply_policy_all || true
 }
 
+# ========== CF加速模式 ==========
+cf_remove_origin_inbounds(){
+  [ -f "$XRAY_CONF" ] || return 0
+  update_xray --argjson p1 "$ORIGIN_VLESS_WS_PORT" --argjson p2 "$ORIGIN_VLESS_XHTTP_PORT" --argjson p3 "$ORIGIN_SS_WS_PORT" \
+    'del(.inbounds[]? | select(.port==$p1 or .port==$p2 or .port==$p3))'
+}
+cf_remove_argo_inbounds(){
+  [ -f "$XRAY_CONF" ] || return 0
+  update_xray 'del(.inbounds[]? | select(.port==8081 or .port==8082 or .port==8083))'
+}
+
+setup_cf_origin(){
+  install_xray || return 1
+  ensure_dns_rule || return 1
+
+  local domain ss_pass mc ss_method uuid ws xh ss xh_json
+  prompt "CF回源域名(用于SNI/Host): " domain
+  [ -z "$domain" ] && { red "域名不能为空"; return 1; }
+
+  prompt "SS密码(回车随机UUID): " ss_pass
+  [ -z "$ss_pass" ] && ss_pass="$(gen_uuid)"
+  prompt "SS加密(1=aes-128-gcm 2=aes-256-gcm，默认1): " mc
+  [ -z "$mc" ] && mc=1
+  ss_method="aes-128-gcm"; [ "$mc" = "2" ] && ss_method="aes-256-gcm"
+
+  uuid="$(xray_uuid)"
+
+  cf_remove_argo_inbounds
+  cf_remove_origin_inbounds
+
+  ws='{"port":'"${ORIGIN_VLESS_WS_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  xh_json="$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" --arg host "$domain" \
+    '{"port":'"${ORIGIN_VLESS_XHTTP_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":$host,"path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')"
+  ss='{"port":'"${ORIGIN_SS_WS_PORT}"',"listen":"0.0.0.0","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+
+  update_xray --argjson ws "$ws" --argjson xh "$xh_json" --argjson ss "$ss" '.inbounds += [$ws,$xh,$ss]'
+
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_cf_origin_check.log 2>&1; then
+    red "Xray 配置校验失败"
+    tail -n 80 /tmp/xray_cf_origin_check.log 2>/dev/null || true
+    cf_remove_origin_inbounds
+    return 1
+  fi
+
+  open_port "$ORIGIN_VLESS_WS_PORT" tcp || yellow "请手动放行 ${ORIGIN_VLESS_WS_PORT}/tcp"
+  open_port "$ORIGIN_VLESS_XHTTP_PORT" tcp || yellow "请手动放行 ${ORIGIN_VLESS_XHTTP_PORT}/tcp"
+  open_port "$ORIGIN_SS_WS_PORT" tcp || yellow "请手动放行 ${ORIGIN_SS_WS_PORT}/tcp"
+
+  # 保存域名到 ARGO_DOMAIN 复用展示逻辑
+  echo "$domain" > "$ARGO_DOMAIN"
+
+  # 停掉argo服务（如有）
+  if service_exists tunnel-argo; then
+    svc stop tunnel-argo || true
+  fi
+
+  svc restart xray
+  CF_MODE="origin"; save_cf_mode
+  ask_enable_youtube_strict
+  green "CF加速已配置为 端口回源 模式（${ORIGIN_VLESS_WS_PORT}/${ORIGIN_VLESS_XHTTP_PORT}/${ORIGIN_SS_WS_PORT}）"
+}
+
 # ========== Argo ==========
 install_cloudflared(){
   mkdir -p "$WORK"
@@ -769,16 +845,21 @@ install_cloudflared(){
   green "cloudflared 安装完成"
 }
 install_argo(){
-  install_xray || return 1; ensure_dns_rule || return 1; install_cloudflared || return 1
+  install_xray || return 1
+  ensure_dns_rule || return 1
+  install_cloudflared || return 1
+
   local domain auth ss_pass mc ss_method tunnel_id uuid
   prompt "Argo域名: " domain; [ -z "$domain" ] && { red "不能为空"; return 1; }
   prompt "Argo JSON凭证: " auth; echo "$auth" | grep -q "TunnelSecret" || { red "必须是JSON凭证"; return 1; }
   prompt "SS密码(回车随机UUID): " ss_pass; [ -z "$ss_pass" ] && ss_pass="$(gen_uuid)"
   prompt "SS加密(1=aes-128-gcm 2=aes-256-gcm，默认1): " mc; [ -z "$mc" ] && mc=1; ss_method="aes-128-gcm"; [ "$mc" = "2" ] && ss_method="aes-256-gcm"
+
   echo "$domain" > "$ARGO_DOMAIN"
   tunnel_id="$(echo "$auth" | jq -r '.TunnelID' 2>/dev/null || true)"
   [ -z "$tunnel_id" ] && tunnel_id="$(echo "$auth" | cut -d'"' -f12)"
   echo "$auth" > "$ARGO_JSON"
+
   cat > "$ARGO_YML" <<EOF
 tunnel: ${tunnel_id}
 credentials-file: ${ARGO_JSON}
@@ -786,26 +867,31 @@ protocol: http2
 ingress:
   - hostname: ${domain}
     path: /argo
-    service: http://localhost:8080
-    originRequest: { noTLSVerify: true }
-  - hostname: ${domain}
-    path: /xgo
     service: http://localhost:8081
     originRequest: { noTLSVerify: true }
   - hostname: ${domain}
-    path: /ssgo
+    path: /xgo
     service: http://localhost:8082
+    originRequest: { noTLSVerify: true }
+  - hostname: ${domain}
+    path: /ssgo
+    service: http://localhost:8083
     originRequest: { noTLSVerify: true }
   - service: http_status:404
 EOF
+
   uuid="$(xray_uuid)"
-  update_xray 'del(.inbounds[]? | select(.port==8080 or .port==8081 or .port==8082))'
+  cf_remove_origin_inbounds
+  cf_remove_argo_inbounds
+
   local ws xh ss
-  ws='{"port":8080,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
-  xh=$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" \
-     '{"port":8081,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')
-  ss='{"port":8082,"listen":"127.0.0.1","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  ws='{"port":8081,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  xh="$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" \
+     '{"port":8082,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":"","path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')"
+  ss='{"port":8083,"listen":"127.0.0.1","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+
   update_xray --argjson ws "$ws" --argjson xh "$xh" --argjson ss "$ss" '.inbounds += [$ws,$xh,$ss]'
+
   [ -x "${WORK}/argo" ] || { red "cloudflared 不存在: ${WORK}/argo"; return 1; }
   local cmd svcname="tunnel-argo"
   cmd="${WORK}/argo tunnel --edge-ip-version auto --no-autoupdate --metrics 127.0.0.1:2000 --config ${ARGO_YML} run"
@@ -839,20 +925,49 @@ EOF
     fi
     svc enable "$svcname"
   fi
-  svc restart xray; svc restart "$svcname"
+
+  svc restart xray
+  svc restart "$svcname"
+
+  CF_MODE="argo"; save_cf_mode
   ask_enable_youtube_strict
   green "Argo 配置完成"
 }
+
+configure_cf_accel(){
+  while true; do
+    cls
+    echo -e "${C_WARN}=========== 配置CF加速 ===========${C_RST}"
+    echo -e "当前模式: \033[1;36m${CF_MODE}\033[0m"
+    echo "-------------------------------------"
+    menu_item_auto "1" "Argo隧道"
+    menu_item_auto "2" "端口回源"
+    menu_item_auto "0" "返回"
+    echo "====================================="
+    prompt "请选择: " m
+    case "$m" in
+      1) install_argo; pause ;;
+      2) setup_cf_origin; pause ;;
+      0) return ;;
+      *) red "无效"; pause ;;
+    esac
+  done
+}
+
 uninstall_argo(){
   svc stop tunnel-argo; svc disable tunnel-argo
   rm -f /etc/init.d/tunnel-argo /etc/systemd/system/tunnel-argo.service "${WORK}/argo_start.sh" "${WORK}/argo"
   rm -f "$ARGO_DOMAIN" "$ARGO_YML" "$ARGO_JSON"
+
   if [ -f "$XRAY_CONF" ]; then
-    update_xray 'del(.inbounds[]? | select(.port==8080 or .port==8081 or .port==8082))'
+    cf_remove_argo_inbounds
+    cf_remove_origin_inbounds
     svc restart xray
   fi
+
   command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
-  green "Argo 已卸载"
+  CF_MODE="argo"; save_cf_mode
+  green "Argo/端口回源 已卸载"
 }
 
 # ========== HY2 multi ==========
@@ -868,7 +983,6 @@ migrate_old_hy2_state(){
   if [ "${has:-0}" -gt 0 ]; then
     return 0
   fi
-  # 迁移旧单实例
   . "$HY2_STATE" 2>/dev/null || true
   if [ -n "${PORT:-}" ] && [ -n "${DOMAIN:-}" ] && [ -n "${PASS:-}" ]; then
     local up down obfs cert_mode tag
@@ -888,7 +1002,6 @@ hy2_port_exists_in_conf(){
 hy2_random_free_port(){
   local old="${1:-0}" p
   while true; do
-    # 20000-65000（含）
     p=$(( RANDOM % (65000 - 20000 + 1) + 20000 ))
     [ "$old" -gt 0 ] && [ "$p" -eq "$old" ] && continue
     if ss -tuln 2>/dev/null | grep -q ":${p} "; then
@@ -1223,9 +1336,9 @@ configure_hy2_reinstall_port(){
 
   cls
   echo -e "${C_WARN}========== HY2端口重装模式 ==========${C_RST}"
-  echo "1) 继承模式（仅换端口）"
-  echo "2) 追加UUID（换端口+重置AUTH）"
-  echo "3) 全新安装（换端口+可改证书/域名/AUTH/OBFS/带宽）"
+  echo "1) 仅换端口"
+  echo "2) 端口+UUID"
+  echo "3) 全新安装"
   echo "0) 取消"
   prompt "请选择: " mode
   case "$mode" in
@@ -1241,8 +1354,8 @@ configure_hy2_reinstall_port(){
   case "$pm" in
     2)
       prompt "输入新端口(20000-65000): " new_port
-[[ "$new_port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
-[ "$new_port" -ge 20000 ] && [ "$new_port" -le 65000 ] || { red "端口越界(20000-65000)"; return 1; }
+      [[ "$new_port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
+      [ "$new_port" -ge 20000 ] && [ "$new_port" -le 65000 ] || { red "端口越界(20000-65000)"; return 1; }
       [ "$new_port" -ne "$old_port" ] || { red "新端口不能与旧端口相同"; return 1; }
       if hy2_port_exists_in_conf "$new_port"; then red "端口已被HY2占用"; return 1; fi
       ;;
@@ -1298,7 +1411,6 @@ configure_hy2_reinstall_port(){
   new_tag="hy2-${new_port}"
   ib="$(hy2_build_inbound_json "$new_tag" "$new_port" "$auth" "$domain" "$cert_file" "$key_file" "$obfs")"
 
-  # 删除旧，追加新
   update_xray --argjson p "$old_port" 'del(.inbounds[]? | select((.protocol=="hysteria" or .protocol=="hysteria2") and .port==$p))'
   update_xray --argjson ib "$ib" '.inbounds += [$ib]'
 
@@ -1350,7 +1462,6 @@ show_hy2_links_only(){
     else
       obf=""
     fi
-    # 关键：改为 up/down，兼容常见客户端
     purple "hysteria2://${a}@${hy_host}:${p}?sni=${d}&insecure=${insec}${obf}&up=${up}&down=${down}#$(url_encode "$hn")"; echo
   done <<< "$list"
   echo "========================================"
@@ -1364,9 +1475,9 @@ manage_hy2(){
 
   while true; do
     cls
-    echo -e "${C_WARN}=============== HY2管理（多实例） ===============${C_RST}"
+    echo -e "${C_WARN}=============== HY2管理 ===============${C_RST}"
     hy2_list_show_table
-    echo "-----------------------------------------------------------------------"
+    
     menu_item_auto "1" "添加HY2实例"
     menu_item_auto "2" "修改HY2实例"
     menu_item_auto "3" "删除HY2实例"
@@ -1401,10 +1512,14 @@ show_xray_nodes(){
   [ "$IP_CHECKED" = "1" ] || load_ip_cache >/dev/null 2>&1 || true
   [ "$IP_CHECKED" = "1" ] || check_ip || true
   [ -f "$XRAY_CONF" ] || { red "xray未安装"; return; }
+  load_cf_mode
+
   local ip="" uuid cnt=0
   ip="$(pick_node_host)"; uuid="$(xray_uuid)"; [ -z "$BASE_FULL" ] && BASE_FULL="Node"
+
   green "=============== 节点链接 ================"
-  if [ -f "$ARGO_DOMAIN" ]; then
+
+  if [ "$CF_MODE" = "argo" ] && [ -f "$ARGO_DOMAIN" ]; then
     local d xextra nx nw ns
     d="$(cat "$ARGO_DOMAIN")"
     xextra="$(url_encode "$XHTTP_EXTRA_JSON")"
@@ -1413,12 +1528,35 @@ show_xray_nodes(){
     purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&fp=chrome&type=ws&host=${d}&path=%2Fargo%3Fed%3D2560#$(url_encode "$nw")"; echo
     cnt=$((cnt+2))
     local ssib
-    ssib="$(jq -c '.inbounds[]? | select(.protocol=="shadowsocks" and .port==8082)' "$XRAY_CONF" 2>/dev/null || true)"
+    ssib="$(jq -c '.inbounds[]? | select(.protocol=="shadowsocks" and .port==8083)' "$XRAY_CONF" 2>/dev/null || true)"
     if [ -n "$ssib" ]; then
       local m pw b64
       m="$(echo "$ssib" | jq -r '.settings.method')"; pw="$(echo "$ssib" | jq -r '.settings.password')"
       b64="$(echo -n "${m}:${pw}" | base64 | tr -d '\n')"
-      purple "ss://${b64}@${SS_FIXED_IP}:8080?type=ws&security=none&host=${d}&path=%2Fssgo#$(url_encode "$ns")"; echo
+      local ss_plugin
+ss_plugin="$(url_encode "v2ray-plugin;mode=websocket;host=${d};path=/ssgo;mux=0")"
+purple "ss://${b64}@${SS_FIXED_IP}:2052?plugin=${ss_plugin}#$(url_encode "$ns")"; echo
+      cnt=$((cnt+1))
+    fi
+  fi
+
+  if [ "$CF_MODE" = "origin" ] && [ -f "$ARGO_DOMAIN" ]; then
+    local d xextra nx nw ns
+    d="$(cat "$ARGO_DOMAIN")"
+    xextra="$(url_encode "$XHTTP_EXTRA_JSON")"
+    nx="${BASE_FULL} - CFOriginXHTTP"; nw="${BASE_FULL} - CFOriginWS"; ns="${BASE_FULL} - CFOriginSS"
+    purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&alpn=h2&fp=chrome&type=xhttp&host=${d}&path=%2Fxgo&mode=${XHTTP_MODE}&extra=${xextra}#$(url_encode "$nx")"; echo
+    purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&fp=chrome&type=ws&host=${d}&path=%2Fargo%3Fed%3D2560#$(url_encode "$nw")"; echo
+    cnt=$((cnt+2))
+    local ssib
+    ssib="$(jq -c --argjson p "$ORIGIN_SS_WS_PORT" '.inbounds[]? | select(.protocol=="shadowsocks" and .port==$p)' "$XRAY_CONF" 2>/dev/null || true)"
+    if [ -n "$ssib" ]; then
+      local m pw b64
+      m="$(echo "$ssib" | jq -r '.settings.method')"; pw="$(echo "$ssib" | jq -r '.settings.password')"
+      b64="$(echo -n "${m}:${pw}" | base64 | tr -d '\n')"
+      local ss_plugin
+ss_plugin="$(url_encode "v2ray-plugin;mode=websocket;host=${d};path=/ssgo;mux=0")"
+purple "ss://${b64}@${SS_FIXED_IP}:2052?plugin=${ss_plugin}#$(url_encode "$ns")"; echo
       cnt=$((cnt+1))
     fi
   fi
@@ -2113,39 +2251,39 @@ manage_outbound_menu(){
     esac
   done
 }
-
 # ========== Xray menu ==========
 xray_menu(){
   while true; do
     cls
-    local xs as hs
+    load_cf_mode
+    local xs as hs cm
     if [ -x "$XRAY_BIN" ]; then xs=$(is_running xray && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else xs="${C_BAD}未安装${C_RST}"; fi
     if service_exists tunnel-argo; then as=$(is_running tunnel-argo && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else as="${C_BAD}未配置${C_RST}"; fi
     init_hy2_list
     if [ "$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then hs="\033[1;36m已配置\033[0m"; else hs="${C_BAD}未配置${C_RST}"; fi
+    cm="$( [ "$CF_MODE" = "origin" ] && echo "端口回源" || echo "Argo隧道" )"
 
     echo -e "${C_OK}=============== Xray管理 ===============${C_RST}"
     echo -e "Xray: ${xs}   Argo: ${as}   HY2: ${hs}"
+    echo -e "CF加速模式: \033[1;36m${cm}\033[0m"
     echo "-----------------------------------------------"
-    menu_row2_auto "1"  "安装Argo"      "8"  "实时日志"
-    menu_row2_auto "2"  "配置HY2"       "9"  "查看节点"
-    menu_row2_auto "3"  "配置Socks5"    "10" "修改UUID"
-    menu_row2_auto "4"  "重启Argo"      "0"  "返回"
+    menu_row2_auto "1"  "配置CF加速"         "8"  "实时日志"
+    menu_row2_auto "2"  "配置HY2"            "9"  "查看节点"
+    menu_row2_auto "3"  "配置Socks5"         "10" "修改UUID"
+    menu_row2_auto "4"  "重启Argo"           "0"  "返回"
     menu_row2_auto "5"  "重启Xray"
     menu_row2_auto "6"  "卸载Argo"
-    menu_row2_auto "7"  "卸载HY2"
     menu_row2_auto "11" "卸载Xray"
     menu_row2_auto "12" "更新Xray"
     echo "==============================================="
     prompt "请选择: " c
     case "$c" in
-      1) install_argo; pause ;;
+      1) configure_cf_accel ;;
       2) manage_hy2 ;;
       3) manage_socks5 ;;
       4) service_exists tunnel-argo && svc restart tunnel-argo && green "Argo 已重启" || red "Argo未安装"; pause ;;
       5) service_exists xray && svc restart xray && green "Xray 已重启" || red "Xray未安装"; pause ;;
       6) uninstall_argo; pause ;;
-      7) uninstall_hy2_all; pause ;;
       8) foreground_xray_log ;;
       9) show_xray_nodes; pause ;;
       10) prompt "新UUID(回车自动): " u; [ -z "$u" ] && u="$(gen_uuid)"; set_xray_uuid "$u"; pause ;;
@@ -2329,7 +2467,6 @@ main_menu(){
     echo "-----------------------------------------------"
     echo -e "IPv4 : ${u4}"
     echo -e "IPv6 : ${u6}"
-    echo "-----------------------------------------------"
     echo -e "${C_DIM}==========================================${C_RST}"
     echo
     menu_row2_auto "1" "管理Xray"   "6" "管理SWAP"
