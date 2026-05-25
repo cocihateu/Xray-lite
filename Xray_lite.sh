@@ -95,6 +95,7 @@ XRAY_CONF="${WORK}/config.json"
 
 TLS_BASE="/etc/lite/tls"
 TLS_DIR_HY2="${TLS_BASE}/hy2"
+TLS_DIR_ORIGIN="${TLS_BASE}/origin"
 
 ARGO_DOMAIN="${WORK}/domain_argo.txt"
 ARGO_YML="${WORK}/tunnel_argo.yml"
@@ -773,6 +774,83 @@ cf_remove_argo_inbounds(){
   update_xray 'del(.inbounds[]? | select(.port==8081 or .port==8082 or .port==8083))'
 }
 
+# Cloudflare Origin CA 签发（端口回源用）
+issue_cert_cf_origin_ca(){
+  local domain="$1" token="$2" cert_dir="${3:-$TLS_DIR_ORIGIN}"
+  local key="${cert_dir}/origin.key"
+  local csr="/tmp/origin.csr"
+  local req="/tmp/cf-origin-req.json"
+  local crt="${cert_dir}/origin.crt"
+
+  mkdir -p "$cert_dir"
+
+  need_cmd openssl || pkg_install openssl
+  need_cmd jq || pkg_install jq
+  need_cmd python3 || pkg_install python3
+  command -v openssl >/dev/null 2>&1 || { red "缺少 openssl"; return 1; }
+  command -v jq >/dev/null 2>&1 || { red "缺少 jq"; return 1; }
+  command -v python3 >/dev/null 2>&1 || { red "缺少 python3"; return 1; }
+
+  if [ -s "$crt" ] && [ -s "$key" ]; then
+    if openssl x509 -in "$crt" -noout -checkend $((30*24*3600)) >/dev/null 2>&1; then
+      green "Origin CA证书已存在且有效(>30天): $domain"
+      return 0
+    else
+      yellow "Origin CA证书即将过期或已过期，重新签发: $domain"
+    fi
+  fi
+
+  yellow "生成私钥与CSR..."
+  openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "$key" \
+    -out "$csr" \
+    -subj "/CN=${domain}" >/tmp/cf_origin_csr.log 2>&1 || {
+    red "生成CSR失败"
+    tail -n 80 /tmp/cf_origin_csr.log 2>/dev/null || true
+    return 1
+  }
+
+  local csr_json
+  csr_json="$(python3 - <<PY
+import json
+print(json.dumps(open("$csr","r").read()))
+PY
+)" || { red "CSR JSON编码失败"; return 1; }
+
+  cat > "$req" <<EOF
+{
+  "csr": ${csr_json},
+  "hostnames": ["${domain}","*.${domain}"],
+  "request_type": "origin-rsa",
+  "requested_validity": 5475
+}
+EOF
+
+  yellow "调用 Cloudflare Origin CA API 签发证书..."
+  local resp success cert
+  resp="$(curl -sS https://api.cloudflare.com/client/v4/certificates \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    --data @"$req" 2>/tmp/cf_origin_api.err || true)"
+
+  success="$(echo "$resp" | jq -r '.success // false' 2>/dev/null || echo false)"
+  if [ "$success" != "true" ]; then
+    red "Origin CA签发失败"
+    echo "$resp" | jq . 2>/dev/null || echo "$resp"
+    [ -s /tmp/cf_origin_api.err ] && tail -n 50 /tmp/cf_origin_api.err
+    return 1
+  fi
+
+  cert="$(echo "$resp" | jq -r '.result.certificate // empty' 2>/dev/null || true)"
+  [ -n "$cert" ] || { red "API返回中未找到证书"; return 1; }
+
+  printf '%s\n' "$cert" > "$crt"
+  [ -s "$crt" ] || { red "写入证书失败"; return 1; }
+
+  chmod 600 "$key" "$crt" 2>/dev/null || true
+  green "Origin CA证书签发成功: $crt"
+}
+
 setup_cf_origin(){
   install_xray || return 1
   ensure_dns_rule || return 1
@@ -780,6 +858,19 @@ setup_cf_origin(){
   local domain ss_pass mc ss_method uuid ws xh ss xh_json
   prompt "CF回源域名(用于SNI/Host): " domain
   [ -z "$domain" ] && { red "域名不能为空"; return 1; }
+
+  local cert_mode cert_file key_file cf_token
+  prompt "回源TLS证书模式(1=不启用TLS 2=CF Origin CA签发，默认1): " cert_mode
+  [ -z "${cert_mode:-}" ] && cert_mode=1
+  [[ "$cert_mode" =~ ^[12]$ ]] || cert_mode=1
+  cert_file=""; key_file=""
+  if [ "$cert_mode" = "2" ]; then
+    prompt "Cloudflare API Token: " cf_token
+    [ -z "$cf_token" ] && { red "Token不能为空"; return 1; }
+    issue_cert_cf_origin_ca "$domain" "$cf_token" "$TLS_DIR_ORIGIN" || return 1
+    cert_file="${TLS_DIR_ORIGIN}/origin.crt"
+    key_file="${TLS_DIR_ORIGIN}/origin.key"
+  fi
 
   prompt "SS密码(回车随机UUID): " ss_pass
   [ -z "$ss_pass" ] && ss_pass="$(gen_uuid)"
@@ -792,10 +883,78 @@ setup_cf_origin(){
   cf_remove_argo_inbounds
   cf_remove_origin_inbounds
 
-  ws='{"port":'"${ORIGIN_VLESS_WS_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
-  xh_json="$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" --arg host "$domain" \
-    '{"port":'"${ORIGIN_VLESS_XHTTP_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":$host,"path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')"
-  ss='{"port":'"${ORIGIN_SS_WS_PORT}"',"listen":"0.0.0.0","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  if [ "$cert_mode" = "2" ]; then
+    ws="$(jq -nc \
+      --argjson p "$ORIGIN_VLESS_WS_PORT" \
+      --arg uuid "$uuid" \
+      --arg host "$domain" \
+      --arg sni "$domain" \
+      --arg crt "$cert_file" \
+      --arg key "$key_file" \
+      '{
+        "port":$p,
+        "listen":"0.0.0.0",
+        "protocol":"vless",
+        "settings":{"clients":[{"id":$uuid}],"decryption":"none"},
+        "streamSettings":{
+          "network":"ws",
+          "security":"tls",
+          "tlsSettings":{"serverName":$sni,"certificates":[{"certificateFile":$crt,"keyFile":$key}]},
+          "wsSettings":{"path":"/argo","headers":{"Host":$host}}
+        },
+        "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+      }')"
+
+    xh_json="$(jq -nc \
+      --argjson p "$ORIGIN_VLESS_XHTTP_PORT" \
+      --arg uuid "$uuid" \
+      --arg mode "$XHTTP_MODE" \
+      --argjson extra "$XHTTP_EXTRA_JSON" \
+      --arg host "$domain" \
+      --arg sni "$domain" \
+      --arg crt "$cert_file" \
+      --arg key "$key_file" \
+      '{
+        "port":$p,
+        "listen":"0.0.0.0",
+        "protocol":"vless",
+        "settings":{"clients":[{"id":$uuid}],"decryption":"none"},
+        "streamSettings":{
+          "network":"xhttp",
+          "security":"tls",
+          "tlsSettings":{"serverName":$sni,"certificates":[{"certificateFile":$crt,"keyFile":$key}]},
+          "xhttpSettings":{"host":$host,"path":"/xgo","mode":$mode,"extra":$extra}
+        },
+        "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+      }')"
+
+    ss="$(jq -nc \
+      --argjson p "$ORIGIN_SS_WS_PORT" \
+      --arg method "$ss_method" \
+      --arg pass "$ss_pass" \
+      --arg host "$domain" \
+      --arg sni "$domain" \
+      --arg crt "$cert_file" \
+      --arg key "$key_file" \
+      '{
+        "port":$p,
+        "listen":"0.0.0.0",
+        "protocol":"shadowsocks",
+        "settings":{"method":$method,"password":$pass,"network":"tcp,udp"},
+        "streamSettings":{
+          "network":"ws",
+          "security":"tls",
+          "tlsSettings":{"serverName":$sni,"certificates":[{"certificateFile":$crt,"keyFile":$key}]},
+          "wsSettings":{"path":"/ssgo","headers":{"Host":$host}}
+        },
+        "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
+      }')"
+  else
+    ws='{"port":'"${ORIGIN_VLESS_WS_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+    xh_json="$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" --arg host "$domain" \
+      '{"port":'"${ORIGIN_VLESS_XHTTP_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":$host,"path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')"
+    ss='{"port":'"${ORIGIN_SS_WS_PORT}"',"listen":"0.0.0.0","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  fi
 
   update_xray --argjson ws "$ws" --argjson xh "$xh_json" --argjson ss "$ss" '.inbounds += [$ws,$xh,$ss]'
 
@@ -823,7 +982,6 @@ setup_cf_origin(){
   ask_enable_youtube_strict
   green "CF加速已配置为 端口回源 模式（${ORIGIN_VLESS_WS_PORT}/${ORIGIN_VLESS_XHTTP_PORT}/${ORIGIN_SS_WS_PORT}）"
 }
-
 # ========== Argo ==========
 install_cloudflared(){
   mkdir -p "$WORK"
