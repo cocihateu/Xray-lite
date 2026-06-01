@@ -216,9 +216,19 @@ gen_uuid(){ cat /proc/sys/kernel/random/uuid; }
 xray_x25519_keys(){
   [ -x "$XRAY_BIN" ] || return 1
   local out priv pub
-  out="$("$XRAY_BIN" x25519 2>/dev/null || true)"
-  priv="$(echo "$out" | awk -F': ' '/Private key/{print $2}' | tr -d '\r')"
-  pub="$(echo "$out" | awk -F': ' '/Public key/{print $2}' | tr -d '\r')"
+
+  out="$("$XRAY_BIN" x25519 2>&1 || true)"
+
+  # 兼容：Private key / PrivateKey
+  priv="$(printf '%s\n' "$out" \
+    | sed -nE 's/^[[:space:]]*Private[[:space:]]*Key[[:space:]]*:[[:space:]]*([^[:space:]]+).*/\1/Ip' \
+    | head -n1)"
+
+  # 兼容：Public key / PublicKey / Password (PublicKey)
+  pub="$(printf '%s\n' "$out" \
+    | sed -nE 's/^.*Public[[:space:]]*Key\)?[[:space:]]*:[[:space:]]*([^[:space:]]+).*/\1/Ip' \
+    | head -n1)"
+
   [ -n "$priv" ] && [ -n "$pub" ] || return 1
   echo "${priv}|${pub}"
 }
