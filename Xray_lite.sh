@@ -108,7 +108,6 @@ ORIGIN_VLESS_WS_PORT=62481
 ORIGIN_VLESS_XHTTP_PORT=62482
 ORIGIN_SS_WS_PORT=62483
 
-RESTART_CONF="${WORK}/restart.conf"
 OUTBOUND_CONF="${WORK}/outbound_policy.conf"
 IPCACHE="${WORK}/ip_cache.conf"
 
@@ -245,14 +244,13 @@ port_exists_in_conf(){
 random_free_port(){
   local p
   while true; do
-    p=$(( RANDOM % (65000 - 20000 + 1) + 20000 ))
+    p=$(( ((RANDOM << 15) | RANDOM) % 65535 + 1 ))
     if ss -tuln 2>/dev/null | grep -q ":${p} "; then
       continue
     fi
     if [ -f "$XRAY_CONF" ] && port_exists_in_conf "$p"; then
       continue
     fi
-    [ "$p" -ne 443 ] || continue
     echo "$p"
     return
   done
@@ -354,6 +352,48 @@ protect_ssh_firewalld(){
   done < <(detect_ssh_ports)
 }
 
+nft_input_base_chains(){
+  # 输出: family|table|chain
+  command -v nft >/dev/null 2>&1 || return 1
+  command -v jq  >/dev/null 2>&1 || return 1
+
+  nft -j list ruleset 2>/dev/null | jq -r '
+    .nftables
+    | map(select(.table or .chain))
+    | . as $all
+    | [ .[] | .table? ] as $tables
+    | [ .[] | .chain?
+        | select(.hook=="input")
+        | select((.type // "filter") == "filter")
+        | {family, table, name}
+      ] as $chains
+    | $chains[]
+    | "\(.family)|\(.table)|\(.name)"
+  ' 2>/dev/null
+}
+
+open_port_nft(){
+  local p="$1" proto="${2:-tcp}"
+  local fam tbl chn ok=0
+
+  # 遍历所有 input 基链（inet/ip/ip6）
+  while IFS='|' read -r fam tbl chn; do
+    [ -n "$fam" ] && [ -n "$tbl" ] && [ -n "$chn" ] || continue
+
+    # 已存在则跳过添加
+    if nft list chain "$fam" "$tbl" "$chn" 2>/dev/null \
+      | grep -Eq "\\b${proto}\\s+dport\\s+${p}\\b.*\\baccept\\b"; then
+      ok=1
+      continue
+    fi
+
+    # 尝试添加
+    nft add rule "$fam" "$tbl" "$chn" "$proto" dport "$p" accept >/dev/null 2>&1 && ok=1 || true
+  done < <(nft_input_base_chains)
+
+  [ "$ok" -eq 1 ]
+}
+
 open_port(){
   local p="$1" proto="${2:-tcp}"
 
@@ -379,18 +419,13 @@ open_port(){
     fi
   fi
 
-  # 3) nftables: 仅在规则链存在时添加，不创建新表/链
-  if command -v nft >/dev/null 2>&1; then
-    if nft list chain inet filter input >/dev/null 2>&1; then
-      nft list chain inet filter input 2>/dev/null | grep -Eq "\\b${proto}\\s+dport\\s+${p}\\b.*\\baccept\\b" || \
-        nft add rule inet filter input ${proto} dport "${p}" accept >/dev/null 2>&1 || true
-
-      if nft list chain inet filter input 2>/dev/null | grep -Eq "\\b${proto}\\s+dport\\s+${p}\\b.*\\baccept\\b"; then
-        green "端口已放行(nftables): ${p}/${proto}"
-        return 0
-      fi
-    fi
+  # 3) nftables: 自动识别所有 input 基链，不创建新表/链
+if command -v nft >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+  if open_port_nft "$p" "$proto"; then
+    green "端口已放行(nftables): ${p}/${proto}"
+    return 0
   fi
+fi
 
   # 4) iptables: 尝试直接加规则（不改服务状态）
   if command -v iptables >/dev/null 2>&1; then
@@ -414,6 +449,25 @@ open_port(){
 }
 
 # ========== State ==========
+cf_mode_display(){
+  # 未配置判定：没有域名文件，且配置中没有 Argo/Origin 对应入站
+  local has_domain=0 has_argo=0 has_origin=0
+  [ -s "$ARGO_DOMAIN" ] && has_domain=1
+
+  if [ -f "$XRAY_CONF" ]; then
+    jq -e '.inbounds[]? | select(.port==8081 or .port==8082 or .port==8083)' "$XRAY_CONF" >/dev/null 2>&1 && has_argo=1 || true
+    jq -e --argjson p1 "$ORIGIN_VLESS_WS_PORT" --argjson p2 "$ORIGIN_VLESS_XHTTP_PORT" --argjson p3 "$ORIGIN_SS_WS_PORT" \
+      '.inbounds[]? | select(.port==$p1 or .port==$p2 or .port==$p3)' "$XRAY_CONF" >/dev/null 2>&1 && has_origin=1 || true
+  fi
+
+  if [ "$has_domain" -eq 0 ] && [ "$has_argo" -eq 0 ] && [ "$has_origin" -eq 0 ]; then
+    echo "未配置"
+    return
+  fi
+
+  [ "$CF_MODE" = "origin" ] && echo "端口回源" || echo "Argo隧道"
+}
+
 load_cf_mode(){
   if [ -f "$CF_MODE_CONF" ]; then
     CF_MODE="$(awk -F= '/^CF_MODE=/{print $2}' "$CF_MODE_CONF" 2>/dev/null || echo "argo")"
@@ -431,10 +485,6 @@ EOF
 }
 
 load_state(){
-  if [ -f "$RESTART_CONF" ]; then
-    RESTART_HOURS="$(cat "$RESTART_CONF" 2>/dev/null || echo 0)"
-    [[ "$RESTART_HOURS" =~ ^[0-9]+$ ]] || RESTART_HOURS=0
-  fi
   if [ -f "$OUTBOUND_CONF" ]; then
     YOUTUBE_MODE="$(awk -F= '/^YOUTUBE_MODE=/{print $2}' "$OUTBOUND_CONF" 2>/dev/null)"
     [[ "$YOUTUBE_MODE" =~ ^[12]$ ]] || YOUTUBE_MODE=1
@@ -685,8 +735,8 @@ update_xray_core(){
 uninstall_xray_only(){
   cls
   echo -e "${C_WARN}=========== 卸载 Xray ===========${C_RST}"
-  echo "1) 卸载程序与服务（保留配置）"
-  echo "2) 完全卸载（程序/服务/配置）"
+  echo "1) 卸载（保留配置）"
+  echo "2) 完全卸载"
   echo "0) 取消"
   prompt "请选择: " m
   case "$m" in
@@ -694,7 +744,7 @@ uninstall_xray_only(){
       svc stop xray; svc disable xray
       rm -f /etc/init.d/xray /etc/systemd/system/xray.service "$XRAY_BIN"
       command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
-      green "Xray已卸载（配置保留）"
+      green "Xray已卸载（保留配置）"
       ;;
     2)
       svc stop xray; svc disable xray
@@ -956,7 +1006,7 @@ configure_cf_accel(){
   while true; do
     cls
     echo -e "${C_WARN}=========== 配置CF加速 ===========${C_RST}"
-    echo -e "当前模式: \033[1;36m${CF_MODE}\033[0m"
+    echo -e "当前模式: \033[1;36m$(cf_mode_display)\033[0m"
     echo "-------------------------------------"
     menu_item_auto "1" "Argo隧道"
     menu_item_auto "2" "端口回源"
@@ -1000,7 +1050,7 @@ hy2_port_exists_in_conf(){
 hy2_random_free_port(){
   local old="${1:-0}" p
   while true; do
-    p=$(( RANDOM % (65000 - 20000 + 1) + 20000 ))
+    p=$(( ((RANDOM << 15) | RANDOM) % 65535 + 1 ))
     [ "$old" -gt 0 ] && [ "$p" -eq "$old" ] && continue
     if ss -tuln 2>/dev/null | grep -q ":${p} "; then
       continue
@@ -1181,7 +1231,7 @@ configure_hy2_add(){
     port="$(hy2_random_free_port 0)"
   else
     [[ "$port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
-    [ "$port" -ge 20000 ] && [ "$port" -le 65000 ] || { red "端口越界(20000-65000)"; return 1; }
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { red "端口越界(1-65535)"; return 1; }
     if hy2_port_exists_in_conf "$port"; then red "端口已被HY2占用"; return 1; fi
     if ss -tuln 2>/dev/null | grep -q ":${port} "; then yellow "警告：系统检测该端口可能被占用"; fi
   fi
@@ -1351,9 +1401,9 @@ configure_hy2_reinstall_port(){
   [ -z "$pm" ] && pm=1
   case "$pm" in
     2)
-      prompt "输入新端口(20000-65000): " new_port
+      prompt "输入新端口: " new_port
       [[ "$new_port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
-      [ "$new_port" -ge 20000 ] && [ "$new_port" -le 65000 ] || { red "端口越界(20000-65000)"; return 1; }
+      [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ] || { red "端口越界(1-65535)"; return 1; }
       [ "$new_port" -ne "$old_port" ] || { red "新端口不能与旧端口相同"; return 1; }
       if hy2_port_exists_in_conf "$new_port"; then red "端口已被HY2占用"; return 1; fi
       ;;
@@ -1453,7 +1503,7 @@ show_hy2_links_only(){
     [[ "$up" =~ ^[0-9]+$ ]] || up=50
     [[ "$down" =~ ^[0-9]+$ ]] || down=250
     insec="0"; [ "$cm" = "self" ] && insec="1"
-    hn="${BASE_FULL} - HY2-${p}"
+    hn="${BASE_FULL} - HY2"
     hy_host="$ip"; [ -z "$hy_host" ] && hy_host="$d"
     if [ -n "$ob" ]; then
       obf="&obfs=salamander&obfs-password=${ob}"
@@ -1557,12 +1607,12 @@ configure_reality_xhttp_add(){
   init_reality_list
 
   local port uuid sni target sid path kp priv pub tag ib
-  prompt "XHTTP-Reality端口(20000-65000，留空随机): " port
+  prompt "XHTTP-Reality端口: " port
   if [ -z "$port" ]; then
     port="$(random_free_port)"
   else
     [[ "$port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
-    [ "$port" -ge 20000 ] && [ "$port" -le 65000 ] || { red "端口越界"; return 1; }
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { red "端口越界(1-65535)"; return 1; }
     port_exists_in_conf "$port" && { red "端口已存在"; return 1; }
   fi
 
@@ -1621,12 +1671,12 @@ configure_reality_vision_add(){
   init_reality_list
 
   local port uuid sni target sid kp priv pub tag ib
-  prompt "Vision-Reality端口(20000-65000，留空随机): " port
+  prompt "Vision-Reality端口: " port
   if [ -z "$port" ]; then
     port="$(random_free_port)"
   else
     [[ "$port" =~ ^[0-9]+$ ]] || { red "端口无效"; return 1; }
-    [ "$port" -ge 20000 ] && [ "$port" -le 65000 ] || { red "端口越界"; return 1; }
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { red "端口越界(1-65535)"; return 1; }
     port_exists_in_conf "$port" && { red "端口已存在"; return 1; }
   fi
 
@@ -1728,10 +1778,10 @@ show_reality_links_only(){
     host="$ip"; [ -z "$host" ] && host="$sni"
 
     if [ "$t" = "xhttp" ]; then
-      name="${BASE_FULL} - RealityXHTTP-${p}"
+      name="${BASE_FULL} - RealityXHTTP"
       purple "vless://${u}@${host}:${p}?encryption=none&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=xhttp&path=$(url_encode "$path")#$(url_encode "$name")"; echo
     else
-      name="${BASE_FULL} - RealityVision-${p}"
+      name="${BASE_FULL} - RealityVision"
       purple "vless://${u}@${host}:${p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp#$(url_encode "$name")"; echo
     fi
   done <<< "$list"
@@ -1827,7 +1877,7 @@ show_xray_nodes(){
       [ -z "$line" ] && continue
       local p u pw n
       p="$(echo "$line" | jq -r '.port')"; u="$(echo "$line" | jq -r '.settings.accounts[0].user')"; pw="$(echo "$line" | jq -r '.settings.accounts[0].pass')"
-      n="${BASE_FULL} - Socks5-${p}"
+      n="${BASE_FULL} - Socks5"
       purple "socks5://${u}:${pw}@${ip}:${p}#$(url_encode "$n")"; echo
       cnt=$((cnt+1))
     done <<< "$sl"
@@ -1850,7 +1900,7 @@ show_xray_nodes(){
       [[ "$up" =~ ^[0-9]+$ ]] || up=50
       [[ "$down" =~ ^[0-9]+$ ]] || down=250
       insec="0"; [ "$cm" = "self" ] && insec="1"
-      hn="${BASE_FULL} - HY2-${p}"
+      hn="${BASE_FULL} - HY2"
       hy_host="$ip"; [ -z "$hy_host" ] && hy_host="$d"
       if [ -n "$ob" ]; then
         obf="&obfs=salamander&obfs-password=${ob}"
@@ -1879,10 +1929,10 @@ show_xray_nodes(){
       host="$ip"; [ -z "$host" ] && host="$sni"
 
       if [ "$t" = "xhttp" ]; then
-        name="${BASE_FULL} - RealityXHTTP-${p}"
+        name="${BASE_FULL} - RealityXHTTP"
         purple "vless://${u}@${host}:${p}?encryption=none&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=xhttp&path=$(url_encode "$path")#$(url_encode "$name")"; echo
       else
-        name="${BASE_FULL} - RealityVision-${p}"
+        name="${BASE_FULL} - RealityVision"
         purple "vless://${u}@${host}:${p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp#$(url_encode "$name")"; echo
       fi
       cnt=$((cnt+1))
@@ -1944,7 +1994,7 @@ manage_socks5(){
     case "$c" in
       1)
         local p u pw ex
-        prompt "端口(20000-65000): " p
+        prompt "端口: " p
         prompt "用户名: " u
         prompt "密码: " pw
 
@@ -2447,8 +2497,6 @@ full_uninstall(){
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed >/dev/null 2>&1 || true
   }
-  command -v crontab >/dev/null 2>&1 && \
-    (crontab -l 2>/dev/null | sed '/#svc-restart-all/d') | crontab - 2>/dev/null || true
   local clr_swap
   prompt "是否同时清理SWAP? (y/N): " clr_swap
   case "${clr_swap:-N}" in
@@ -2462,7 +2510,7 @@ full_uninstall(){
   esac
   rm -f /usr/local/bin/xray
   rm -rf "$WORK"
-  green "已彻底卸载（服务/配置/快捷方式/监控/SWAP 已清理）"
+  green "已彻底卸载（服务/配置/快捷方式/监控）"
 }
 
 # ========== Outbound menu ==========
@@ -2559,7 +2607,7 @@ xray_menu(){
     if [ "$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then hs="\033[1;36m已配置\033[0m"; else hs="${C_BAD}未配置${C_RST}"; fi
     init_reality_list
     if [ "$(jq 'length' "$REALITY_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then rs="\033[1;36m已配置\033[0m"; else rs="${C_BAD}未配置${C_RST}"; fi
-    cm="$( [ "$CF_MODE" = "origin" ] && echo "端口回源" || echo "Argo隧道" )"
+    cm="$(cf_mode_display)"
 
     echo -e "${C_OK}=============== Xray管理 ===============${C_RST}"
     echo -e "Xray: ${xs}   Argo: ${as}   HY2: ${hs}   Reality: ${rs}"
