@@ -1070,7 +1070,7 @@ hy2_build_inbound_json(){
   "listen":"::",
   "port":$p,
   "protocol":"hysteria",
-  "settings":{"version":2,"users":[{"auth":$auth,"email":"hy2@local"}]},
+  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
   "streamSettings":{
     "network":"hysteria",
     "security":"tls",
@@ -1095,7 +1095,7 @@ hy2_build_inbound_json(){
   "listen":"::",
   "port":$p,
   "protocol":"hysteria",
-  "settings":{"version":2,"users":[{"auth":$auth,"email":"hy2@local"}]},
+  "settings":{"version":2,"clients":[{"auth":$auth,"email":"hy2@local"}]},
   "streamSettings":{
     "network":"hysteria",
     "security":"tls",
