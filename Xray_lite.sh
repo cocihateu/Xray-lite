@@ -96,9 +96,14 @@ XRAY_CONF="${WORK}/config.json"
 TLS_BASE="/etc/lite/tls"
 TLS_DIR_HY2="${TLS_BASE}/hy2"
 
+CF_API_CONF="${WORK}/cloudflare_api.conf"
+CF_API_BOOTSTRAP_DONE="${WORK}/cloudflare_api_bootstrap.done"
+
 ARGO_DOMAIN="${WORK}/domain_argo.txt"
 ARGO_YML="${WORK}/tunnel_argo.yml"
 ARGO_JSON="${WORK}/tunnel_argo.json"
+ARGO_TOKEN_FILE="${WORK}/tunnel_argo.token"
+ARGO_TUNNEL_ID_FILE="${WORK}/tunnel_argo.id"
 
 # CF加速模式: argo | origin
 # origin 模式使用固定回源端口
@@ -147,6 +152,7 @@ V6_SITES=""
 
 IP_CHECKED=0; IP_CACHE_MTIME=0; WAN4=""; WAN6=""; COUNTRY4=""; COUNTRY6=""; ISP4=""; ISP6=""; EMOJI4=""; EMOJI6=""; BASE_REGION="Node"; BASE_FULL="Node"
 CPU_LAST_TOTAL=0; CPU_LAST_IDLE=0
+CF_API_TOKEN=""; CF_API_ACCOUNT_ID=""
 
 # ========== Service ==========
 is_alpine(){ [ -f /etc/alpine-release ]; }
@@ -182,8 +188,9 @@ ensure_deps(){
   need_cmd unzip || pkg_install unzip
   need_cmd openssl || pkg_install openssl
   need_cmd ss || pkg_install iproute2
+  need_cmd curl || pkg_install curl
   [ -f /etc/alpine-release ] && pkg_install ca-certificates || true
-  for c in jq wget ip ss base64 tar unzip openssl; do
+  for c in jq wget ip ss base64 tar unzip openssl curl; do
     command -v "$c" >/dev/null 2>&1 || { red "依赖缺失: $c"; return 1; }
   done
   return 0
@@ -218,12 +225,10 @@ xray_x25519_keys(){
 
   out="$("$XRAY_BIN" x25519 2>&1 || true)"
 
-  # 兼容：Private key / PrivateKey
   priv="$(printf '%s\n' "$out" \
     | sed -nE 's/^[[:space:]]*Private[[:space:]]*Key[[:space:]]*:[[:space:]]*([^[:space:]]+).*/\1/Ip' \
     | head -n1)"
 
-  # 兼容：Public key / PublicKey / Password (PublicKey)
   pub="$(printf '%s\n' "$out" \
     | sed -nE 's/^.*Public[[:space:]]*Key\)?[[:space:]]*:[[:space:]]*([^[:space:]]+).*/\1/Ip' \
     | head -n1)"
@@ -353,7 +358,6 @@ protect_ssh_firewalld(){
 }
 
 nft_input_base_chains(){
-  # 输出: family|table|chain
   command -v nft >/dev/null 2>&1 || return 1
   command -v jq  >/dev/null 2>&1 || return 1
 
@@ -376,18 +380,13 @@ open_port_nft(){
   local p="$1" proto="${2:-tcp}"
   local fam tbl chn ok=0
 
-  # 遍历所有 input 基链（inet/ip/ip6）
   while IFS='|' read -r fam tbl chn; do
     [ -n "$fam" ] && [ -n "$tbl" ] && [ -n "$chn" ] || continue
-
-    # 已存在则跳过添加
     if nft list chain "$fam" "$tbl" "$chn" 2>/dev/null \
       | grep -Eq "\\b${proto}\\s+dport\\s+${p}\\b.*\\baccept\\b"; then
       ok=1
       continue
     fi
-
-    # 尝试添加
     nft add rule "$fam" "$tbl" "$chn" "$proto" dport "$p" accept >/dev/null 2>&1 && ok=1 || true
   done < <(nft_input_base_chains)
 
@@ -397,7 +396,6 @@ open_port_nft(){
 open_port(){
   local p="$1" proto="${2:-tcp}"
 
-  # 1) ufw: 仅在已启用时添加规则，不主动 enable
   if command -v ufw >/dev/null 2>&1; then
     if ufw status 2>/dev/null | grep -qi '^Status: active'; then
       ufw allow "${p}/${proto}" >/dev/null 2>&1 && {
@@ -407,7 +405,6 @@ open_port(){
     fi
   fi
 
-  # 2) firewalld: 仅在已运行时添加规则，不主动启动
   if command -v firewall-cmd >/dev/null 2>&1; then
     if firewall-cmd --state 2>/dev/null | grep -qi '^running$'; then
       firewall-cmd --add-port="${p}/${proto}" --permanent >/dev/null 2>&1 || true
@@ -419,15 +416,13 @@ open_port(){
     fi
   fi
 
-  # 3) nftables: 自动识别所有 input 基链，不创建新表/链
-if command -v nft >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-  if open_port_nft "$p" "$proto"; then
-    green "端口已放行(nftables): ${p}/${proto}"
-    return 0
+  if command -v nft >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    if open_port_nft "$p" "$proto"; then
+      green "端口已放行(nftables): ${p}/${proto}"
+      return 0
+    fi
   fi
-fi
 
-  # 4) iptables: 尝试直接加规则（不改服务状态）
   if command -v iptables >/dev/null 2>&1; then
     local ok4=1 ok6=1
     iptables -C INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 || \
@@ -450,7 +445,6 @@ fi
 
 # ========== State ==========
 cf_mode_display(){
-  # 未配置判定：没有域名文件，且配置中没有 Argo/Origin 对应入站
   local has_domain=0 has_argo=0 has_origin=0
   [ -s "$ARGO_DOMAIN" ] && has_domain=1
 
@@ -491,6 +485,7 @@ load_state(){
     V6_SITES="$(awk -F= '/^V6_SITES=/{print $2}' "$OUTBOUND_CONF" 2>/dev/null)"
   fi
   load_cf_mode
+  load_cf_api >/dev/null 2>&1 || true
 }
 save_outbound(){
   mkdir -p "$WORK"
@@ -498,6 +493,293 @@ save_outbound(){
 YOUTUBE_MODE=${YOUTUBE_MODE}
 V6_SITES=${V6_SITES}
 EOF
+}
+
+# ========== Cloudflare API ==========
+load_cf_api(){
+  [ -f "$CF_API_CONF" ] || return 1
+  . "$CF_API_CONF" 2>/dev/null || return 1
+  return 0
+}
+save_cf_api(){
+  mkdir -p "$WORK"
+  cat > "$CF_API_CONF" <<EOF
+CF_API_TOKEN=$(printf '%q' "${CF_API_TOKEN:-}")
+CF_API_ACCOUNT_ID=$(printf '%q' "${CF_API_ACCOUNT_ID:-}")
+EOF
+  chmod 600 "$CF_API_CONF" 2>/dev/null || true
+}
+cf_show_token_guide(){
+  cat >&2 <<'EOF'
+
+================ Cloudflare Token 创建说明 ================
+1) 登录 Cloudflare Dashboard
+2) 右上角头像 -> My Profile -> API Tokens -> Create Token
+3) 选择 Create Custom Token
+4) 推荐名称：xray-lite-auto
+5) 建议权限：
+   - Account > Cloudflare Tunnel > Edit
+   - Account > Account Rulesets > Edit
+   - Account > Account Filter Lists > Edit
+   - Zone > DNS > Edit
+   - Zone > Zone > Read
+   - Zone > Origin Rules > Edit
+   - Zone > Cache Rules > Edit
+6) Account Resources：
+   - Include -> 你的 Account（或 All accounts）
+7) Zone Resources：
+   - Include -> 你的域名所在 Zone（或 All zones）
+8) 创建后复制 Token，粘贴到脚本即可
+
+用途：
+- Argo 自动创建 Tunnel + 下发远程 ingress + 自动建 DNS
+- 端口回源自动配置 Origin Rules
+- XHTTP 自动配置绕过缓存 Cache Rules
+- HY2 使用 CF DNS API 自动签发证书
+==========================================================
+
+EOF
+}
+cf_bootstrap_once(){
+  local feature="${1:-功能}" yn tok
+  load_cf_api >/dev/null 2>&1 || true
+  [ -f "$CF_API_BOOTSTRAP_DONE" ] && return 0
+  if [ -n "${CF_API_TOKEN:-}" ]; then
+    touch "$CF_API_BOOTSTRAP_DONE"
+    return 0
+  fi
+  cls
+  echo -e "${C_WARN}=========== Cloudflare 自动配置 ===========${C_RST}"
+  echo "检测到首次安装 ${feature}"
+  echo "是否保存一个全局 Cloudflare API Token 供后续自动化复用："
+  echo " - Argo 自动建 Tunnel"
+  echo " - CF 端口回源自动建 Origin Rules"
+  echo " - XHTTP 自动建绕过缓存 Cache Rules"
+  echo " - HY2 复用 Token 自动签证书"
+  echo "-------------------------------------"
+  prompt "是否现在配置全局 Cloudflare API Token? (y/N): " yn
+  case "${yn:-N}" in
+    y|Y|yes|YES)
+      cf_show_token_guide
+      prompt "请输入 Cloudflare API Token: " tok
+      if [ -n "$tok" ]; then
+        CF_API_TOKEN="$tok"
+        save_cf_api
+        green "Cloudflare API Token 已保存"
+      else
+        yellow "未输入 Token，已跳过"
+      fi
+      ;;
+    *)
+      yellow "已跳过 Cloudflare 自动配置引导"
+      ;;
+  esac
+  touch "$CF_API_BOOTSTRAP_DONE"
+}
+cf_require_token(){
+  local tok
+  load_cf_api >/dev/null 2>&1 || true
+  [ -n "${CF_API_TOKEN:-}" ] && return 0
+  yellow "当前未配置全局 Cloudflare API Token"
+  cf_show_token_guide
+  prompt "请输入 Cloudflare API Token(留空取消): " tok
+  [ -n "$tok" ] || { red "未输入 Token"; return 1; }
+  CF_API_TOKEN="$tok"
+  save_cf_api
+  green "Cloudflare API Token 已保存"
+}
+cf_ref_safe(){
+  echo "$1" | tr '.:/-@' '_' | tr -cd 'a-zA-Z0-9_' | cut -c1-40
+}
+cf_api_call(){
+  local method="$1" endpoint="$2" data="${3:-}" resp errf="/tmp/cf_api_err.log"
+  load_cf_api >/dev/null 2>&1 || true
+  [ -n "${CF_API_TOKEN:-}" ] || { red "未配置 Cloudflare API Token"; return 1; }
+
+  if [ -n "$data" ]; then
+    resp="$(curl -fsS -X "$method" "https://api.cloudflare.com/client/v4${endpoint}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "$data" 2>"$errf" || true)"
+  else
+    resp="$(curl -fsS -X "$method" "https://api.cloudflare.com/client/v4${endpoint}" \
+      -H "Authorization: Bearer ${CF_API_TOKEN}" \
+      -H "Content-Type: application/json" 2>"$errf" || true)"
+  fi
+
+  [ -n "$resp" ] || {
+    red "Cloudflare API 请求失败: ${endpoint}"
+    tail -n 20 "$errf" 2>/dev/null >&2 || true
+    return 1
+  }
+
+  if ! echo "$resp" | jq -e '.success == true' >/dev/null 2>&1; then
+    red "Cloudflare API 返回失败: ${endpoint}"
+    echo "$resp" | jq -r '.errors[]? | "- \(.message // .code // "unknown error")"' 2>/dev/null >&2 || echo "$resp" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$resp"
+}
+cf_get_zone_meta_by_domain(){
+  local domain cand resp len zid zname aid
+  domain="$(normalize_domain_item "$1")"
+  [ -n "$domain" ] || return 1
+  cand="$domain"
+  while [ -n "$cand" ]; do
+    resp="$(cf_api_call GET "/zones?name=$(url_encode "$cand")&status=active&per_page=1" "" 2>/dev/null || true)"
+    if [ -n "$resp" ]; then
+      len="$(echo "$resp" | jq -r '.result | length' 2>/dev/null || echo 0)"
+      if [ "${len:-0}" -gt 0 ]; then
+        zid="$(echo "$resp" | jq -r '.result[0].id // empty')"
+        zname="$(echo "$resp" | jq -r '.result[0].name // empty')"
+        aid="$(echo "$resp" | jq -r '.result[0].account.id // empty')"
+        [ -n "$aid" ] && CF_API_ACCOUNT_ID="$aid" && save_cf_api || true
+        echo "${zid}|${zname}|${aid}"
+        return 0
+      fi
+    fi
+    [[ "$cand" == *.* ]] || break
+    cand="${cand#*.}"
+  done
+  return 1
+}
+cf_resolve_zone_and_account_interactive(){
+  local domain="$1" meta zid aid zname
+  meta="$(cf_get_zone_meta_by_domain "$domain" || true)"
+  if [ -n "$meta" ]; then
+    echo "$meta"
+    return 0
+  fi
+  yellow "未能根据域名自动识别 Zone / Account，请手动输入"
+  prompt "Zone ID: " zid
+  [ -n "$zid" ] || { red "Zone ID 不能为空"; return 1; }
+  prompt "Account ID: " aid
+  [ -n "$aid" ] || { red "Account ID 不能为空"; return 1; }
+  zname="$(normalize_domain_item "$domain")"
+  CF_API_ACCOUNT_ID="$aid"; save_cf_api
+  echo "${zid}|${zname}|${aid}"
+}
+cf_upsert_dns_record_cname(){
+  local zone_id="$1" name="$2" target="$3"
+  local resp recid payload
+  name="$(normalize_domain_item "$name")"
+  payload="$(jq -nc --arg name "$name" --arg content "$target" '{"type":"CNAME","name":$name,"content":$content,"proxied":true}')"
+  resp="$(cf_api_call GET "/zones/${zone_id}/dns_records?name=$(url_encode "$name")&per_page=100" "")" || return 1
+  recid="$(echo "$resp" | jq -r '.result[0].id // empty')"
+  if [ -n "$recid" ]; then
+    cf_api_call PUT "/zones/${zone_id}/dns_records/${recid}" "$payload" >/dev/null || return 1
+  else
+    cf_api_call POST "/zones/${zone_id}/dns_records" "$payload" >/dev/null || return 1
+  fi
+  green "Cloudflare DNS 已更新: ${name} -> ${target}"
+}
+cf_get_or_create_ruleset(){
+  local zone_id="$1" phase="$2" name="$3" desc="$4"
+  local resp rid payload
+  resp="$(cf_api_call GET "/zones/${zone_id}/rulesets?phase=$(url_encode "$phase")" "" || true)"
+  rid="$(echo "$resp" | jq -r '.result[]? | select(.phase=="'"${phase}"'") | .id' 2>/dev/null | head -n1 || true)"
+  if [ -n "$rid" ]; then
+    echo "$rid"
+    return 0
+  fi
+  payload="$(jq -nc --arg name "$name" --arg desc "$desc" --arg phase "$phase" '{"name":$name,"description":$desc,"kind":"zone","phase":$phase,"rules":[]}')"
+  resp="$(cf_api_call POST "/zones/${zone_id}/rulesets" "$payload")" || return 1
+  echo "$resp" | jq -r '.result.id'
+}
+cf_upsert_ruleset_rule(){
+  local zone_id="$1" rid="$2" ref="$3" action="$4" expr="$5" desc="$6" action_params="$7"
+  local resp curr newrule newrules payload
+  resp="$(cf_api_call GET "/zones/${zone_id}/rulesets/${rid}" "")" || return 1
+  curr="$(echo "$resp" | jq '.result.rules // []')"
+  newrule="$(jq -nc \
+    --arg ref "$ref" \
+    --arg action "$action" \
+    --arg expr "$expr" \
+    --arg desc "$desc" \
+    --argjson ap "$action_params" \
+    '{"ref":$ref,"description":$desc,"expression":$expr,"action":$action,"action_parameters":$ap,"enabled":true}')"
+  newrules="$(jq -nc --argjson curr "$curr" --argjson nr "$newrule" '($curr | map(select(.ref != $nr.ref))) + [$nr]')"
+  payload="$(jq -nc --argjson rules "$newrules" '{"rules":$rules}')"
+  cf_api_call PUT "/zones/${zone_id}/rulesets/${rid}" "$payload" >/dev/null || return 1
+}
+cf_apply_origin_rules_for_domain(){
+  local domain="$1" meta zone_id zone_name account_id rid safe expr ap
+  load_cf_api >/dev/null 2>&1 || true
+  [ -n "${CF_API_TOKEN:-}" ] || { yellow "未配置全局 Cloudflare API Token，已跳过 Origin Rules 自动配置"; return 1; }
+
+  meta="$(cf_resolve_zone_and_account_interactive "$domain")" || return 1
+  IFS='|' read -r zone_id zone_name account_id <<< "$meta"
+  rid="$(cf_get_or_create_ruleset "$zone_id" "http_request_origin" "Origin Rules ruleset" "Zone-level ruleset that will execute origin rules.")" || return 1
+  safe="$(cf_ref_safe "$domain")"
+
+  expr="(http.host eq \"${domain}\" and starts_with(http.request.uri.path, \"/argo\"))"
+  ap='{"origin":{"port":62481}}'
+  cf_upsert_ruleset_rule "$zone_id" "$rid" "xray_origin_ws_${safe}" "route" "$expr" "Xray CF-Origin WS /argo -> 62481" "$ap" || return 1
+
+  expr="(http.host eq \"${domain}\" and starts_with(http.request.uri.path, \"/xgo\"))"
+  ap='{"origin":{"port":62482}}'
+  cf_upsert_ruleset_rule "$zone_id" "$rid" "xray_origin_xhttp_${safe}" "route" "$expr" "Xray CF-Origin XHTTP /xgo -> 62482" "$ap" || return 1
+
+  expr="(http.host eq \"${domain}\" and starts_with(http.request.uri.path, \"/ssgo\"))"
+  ap='{"origin":{"port":62483}}'
+  cf_upsert_ruleset_rule "$zone_id" "$rid" "xray_origin_ss_${safe}" "route" "$expr" "Xray CF-Origin SS /ssgo -> 62483" "$ap" || return 1
+
+  green "Cloudflare Origin Rules 已自动配置: ${domain}"
+}
+cf_apply_xhttp_cache_bypass_for_domain(){
+  local domain="$1" meta zone_id zone_name account_id rid safe expr ap
+  load_cf_api >/dev/null 2>&1 || true
+  [ -n "${CF_API_TOKEN:-}" ] || { yellow "未配置全局 Cloudflare API Token，已跳过 Cache Rules 自动配置"; return 1; }
+
+  meta="$(cf_resolve_zone_and_account_interactive "$domain")" || return 1
+  IFS='|' read -r zone_id zone_name account_id <<< "$meta"
+  rid="$(cf_get_or_create_ruleset "$zone_id" "http_request_cache_settings" "Cache Rules ruleset" "Zone-level ruleset that will execute cache rules.")" || return 1
+  safe="$(cf_ref_safe "$domain")"
+
+  expr="(http.host eq \"${domain}\" and starts_with(http.request.uri.path, \"/xgo\"))"
+  ap='{"cache":false}'
+  cf_upsert_ruleset_rule "$zone_id" "$rid" "xray_xhttp_bypass_cache_${safe}" "set_cache_settings" "$expr" "Bypass cache for Xray XHTTP /xgo" "$ap" || return 1
+
+  green "Cloudflare Cache Rules 已自动配置: XHTTP /xgo 绕过缓存"
+}
+cf_create_argo_tunnel_remote(){
+  local domain="$1" meta zone_id zone_name account_id tunnel_name payload resp tunnel_id tunnel_token
+  cf_require_token || return 1
+
+  meta="$(cf_resolve_zone_and_account_interactive "$domain")" || return 1
+  IFS='|' read -r zone_id zone_name account_id <<< "$meta"
+  [ -n "$account_id" ] || account_id="${CF_API_ACCOUNT_ID:-}"
+  [ -n "$account_id" ] || { red "无法确定 Cloudflare Account ID"; return 1; }
+
+  tunnel_name="xray-$(hostname 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 12)-$(rand_alnum 6)"
+  payload="$(jq -nc --arg name "$tunnel_name" '{"name":$name,"config_src":"cloudflare"}')"
+  resp="$(cf_api_call POST "/accounts/${account_id}/cfd_tunnel" "$payload")" || return 1
+
+  tunnel_id="$(echo "$resp" | jq -r '.result.id // empty')"
+  tunnel_token="$(echo "$resp" | jq -r '.result.token // empty')"
+  [ -n "$tunnel_id" ] && [ -n "$tunnel_token" ] || { red "Tunnel 创建成功但未取到 id/token"; return 1; }
+
+  payload="$(jq -nc --arg domain "$domain" '{
+    "config":{
+      "ingress":[
+        {"hostname":$domain,"path":"/argo","service":"http://localhost:8081","originRequest":{"noTLSVerify":true}},
+        {"hostname":$domain,"path":"/xgo","service":"http://localhost:8082","originRequest":{"noTLSVerify":true}},
+        {"hostname":$domain,"path":"/ssgo","service":"http://localhost:8083","originRequest":{"noTLSVerify":true}},
+        {"service":"http_status:404"}
+      ]
+    }
+  }')"
+  cf_api_call PUT "/accounts/${account_id}/cfd_tunnel/${tunnel_id}/configurations" "$payload" >/dev/null || return 1
+
+  cf_upsert_dns_record_cname "$zone_id" "$domain" "${tunnel_id}.cfargotunnel.com" || return 1
+
+  echo "$tunnel_id" > "$ARGO_TUNNEL_ID_FILE"
+  echo "$tunnel_token" > "$ARGO_TOKEN_FILE"
+  chmod 600 "$ARGO_TUNNEL_ID_FILE" "$ARGO_TOKEN_FILE" 2>/dev/null || true
+
+  CF_API_ACCOUNT_ID="$account_id"; save_cf_api
+  green "Argo Tunnel 已自动创建并下发远程配置"
 }
 
 # ========== IP / ISP ==========
@@ -671,10 +953,36 @@ xray_uuid(){
   echo "$UUID_FALLBACK"
 }
 set_xray_uuid(){
-  local u="$1"; [ -f "$XRAY_CONF" ] || { red "xray未安装"; return 1; }
-  update_xray --arg uuid "$u" '(.inbounds[]? | select(.protocol=="vless") | .settings.clients[0].id) |= $uuid'
-  svc restart xray; green "UUID已更新: $u"
+  local u="$1"
+  [ -f "$XRAY_CONF" ] || { red "xray未安装"; return 1; }
+
+  # 修改所有 VLESS 入站，包括 Argo / Origin / Reality
+  update_xray --arg uuid "$u" '
+    (.inbounds[]?
+      | select(.protocol=="vless")
+      | .settings.clients[0].id) |= $uuid
+  '
+
+  # 同步 Reality 链接缓存列表，否则查看 Reality 链接时仍显示旧 UUID
+  if [ -f "$REALITY_LIST" ]; then
+    if jq --arg uuid "$u" 'map(.uuid=$uuid)' "$REALITY_LIST" > "${REALITY_LIST}.tmp"; then
+      mv "${REALITY_LIST}.tmp" "$REALITY_LIST"
+    else
+      rm -f "${REALITY_LIST}.tmp"
+      yellow "Reality 列表 UUID 同步失败，请检查: $REALITY_LIST"
+    fi
+  fi
+
+  if [ -x "$XRAY_BIN" ] && ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_uuid_check.log 2>&1; then
+    red "UUID 修改后配置校验失败，请检查配置"
+    tail -n 80 /tmp/xray_uuid_check.log 2>/dev/null || true
+    return 1
+  fi
+
+  svc restart xray
+  green "UUID已全局更新: $u"
 }
+
 install_xray(){
   ensure_deps || return 1; mkdir -p "$WORK"; init_xray_conf; ensure_dns_rule
   if [ ! -x "$XRAY_BIN" ]; then
@@ -844,6 +1152,7 @@ cf_remove_argo_inbounds(){
 setup_cf_origin(){
   install_xray || return 1
   ensure_dns_rule || return 1
+  cf_bootstrap_once "CF回源"
 
   local domain ss_pass mc ss_method uuid ws xh ss xh_json
   prompt "CF回源域名(用于SNI/Host): " domain
@@ -860,10 +1169,10 @@ setup_cf_origin(){
   cf_remove_argo_inbounds
   cf_remove_origin_inbounds
 
-  ws='{"port":'"${ORIGIN_VLESS_WS_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  ws='{"port":'"${ORIGIN_VLESS_WS_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":"'"${uuid}"'"}],"decryption":"none"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/argo","host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
   xh_json="$(jq -nc --arg uuid "$uuid" --arg mode "$XHTTP_MODE" --argjson extra "$XHTTP_EXTRA_JSON" --arg host "$domain" \
     '{"port":'"${ORIGIN_VLESS_XHTTP_PORT}"',"listen":"0.0.0.0","protocol":"vless","settings":{"clients":[{"id":$uuid}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"host":$host,"path":"/xgo","mode":$mode,"extra":$extra}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}')"
-  ss='{"port":'"${ORIGIN_SS_WS_PORT}"',"listen":"0.0.0.0","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo","headers":{"Host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
+  ss='{"port":'"${ORIGIN_SS_WS_PORT}"',"listen":"0.0.0.0","protocol":"shadowsocks","settings":{"method":"'"${ss_method}"'","password":"'"${ss_pass}"'","network":"tcp,udp"},"streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/ssgo","host":"'"${domain}"'"}}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}}'
 
   update_xray --argjson ws "$ws" --argjson xh "$xh_json" --argjson ss "$ss" '.inbounds += [$ws,$xh,$ss]'
 
@@ -878,12 +1187,18 @@ setup_cf_origin(){
   open_port "$ORIGIN_VLESS_XHTTP_PORT" tcp || yellow "请手动放行 ${ORIGIN_VLESS_XHTTP_PORT}/tcp"
   open_port "$ORIGIN_SS_WS_PORT" tcp || yellow "请手动放行 ${ORIGIN_SS_WS_PORT}/tcp"
 
-  # 保存域名到 ARGO_DOMAIN 复用展示逻辑
   echo "$domain" > "$ARGO_DOMAIN"
 
-  # 停掉argo服务（如有）
   if service_exists tunnel-argo; then
     svc stop tunnel-argo || true
+  fi
+
+  load_cf_api >/dev/null 2>&1 || true
+  if [ -n "${CF_API_TOKEN:-}" ]; then
+    cf_apply_origin_rules_for_domain "$domain" || yellow "Origin Rules 自动配置失败，请手动到 Cloudflare 配置"
+    cf_apply_xhttp_cache_bypass_for_domain "$domain" || yellow "Cache Rules 自动配置失败，请手动到 Cloudflare 配置"
+  else
+    yellow "未配置全局 Cloudflare API Token，已跳过 Origin Rules / Cache Rules 自动配置"
   fi
 
   svc restart xray
@@ -912,42 +1227,53 @@ install_cloudflared(){
   "$bin" --version >/dev/null 2>&1 || { red "cloudflared 校验失败"; rm -f "$bin"; return 1; }
   green "cloudflared 安装完成"
 }
+write_argo_service(){
+  local svcname="tunnel-argo"
+  cat > "${WORK}/argo_start.sh" <<EOF
+#!/bin/sh
+TOKEN=\$(cat "${ARGO_TOKEN_FILE}" 2>/dev/null)
+exec ${WORK}/argo tunnel --edge-ip-version auto --no-autoupdate --metrics 127.0.0.1:2000 run --token "\${TOKEN}"
+EOF
+  chmod +x "${WORK}/argo_start.sh"
+  if is_alpine; then
+    cat > /etc/init.d/${svcname} <<EOF
+#!/sbin/openrc-run
+description="Cloudflare Tunnel"
+command="${WORK}/argo_start.sh"
+command_background=true
+pidfile="/var/run/${svcname}.pid"
+EOF
+    chmod +x /etc/init.d/${svcname}
+  else
+    cat > /etc/systemd/system/${svcname}.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target
+[Service]
+ExecStart=${WORK}/argo_start.sh
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+  svc enable "$svcname"
+}
 install_argo(){
   install_xray || return 1
   ensure_dns_rule || return 1
   install_cloudflared || return 1
+  cf_bootstrap_once "Argo"
 
-  local domain auth ss_pass mc ss_method tunnel_id uuid
+  local domain ss_pass mc ss_method uuid
   prompt "Argo域名: " domain; [ -z "$domain" ] && { red "不能为空"; return 1; }
-  prompt "Argo JSON凭证: " auth; echo "$auth" | grep -q "TunnelSecret" || { red "必须是JSON凭证"; return 1; }
   prompt "SS密码(回车随机UUID): " ss_pass; [ -z "$ss_pass" ] && ss_pass="$(gen_uuid)"
   prompt "SS加密(1=aes-128-gcm 2=aes-256-gcm，默认1): " mc; [ -z "$mc" ] && mc=1; ss_method="aes-128-gcm"; [ "$mc" = "2" ] && ss_method="aes-256-gcm"
 
+  cf_require_token || return 1
+  cf_create_argo_tunnel_remote "$domain" || return 1
+
   echo "$domain" > "$ARGO_DOMAIN"
-  tunnel_id="$(echo "$auth" | jq -r '.TunnelID' 2>/dev/null || true)"
-  [ -z "$tunnel_id" ] && tunnel_id="$(echo "$auth" | cut -d'"' -f12)"
-  echo "$auth" > "$ARGO_JSON"
-
-  cat > "$ARGO_YML" <<EOF
-tunnel: ${tunnel_id}
-credentials-file: ${ARGO_JSON}
-protocol: http2
-ingress:
-  - hostname: ${domain}
-    path: /argo
-    service: http://localhost:8081
-    originRequest: { noTLSVerify: true }
-  - hostname: ${domain}
-    path: /xgo
-    service: http://localhost:8082
-    originRequest: { noTLSVerify: true }
-  - hostname: ${domain}
-    path: /ssgo
-    service: http://localhost:8083
-    originRequest: { noTLSVerify: true }
-  - service: http_status:404
-EOF
-
   uuid="$(xray_uuid)"
   cf_remove_origin_inbounds
   cf_remove_argo_inbounds
@@ -960,46 +1286,24 @@ EOF
 
   update_xray --argjson ws "$ws" --argjson xh "$xh" --argjson ss "$ss" '.inbounds += [$ws,$xh,$ss]'
 
-  [ -x "${WORK}/argo" ] || { red "cloudflared 不存在: ${WORK}/argo"; return 1; }
-  local cmd svcname="tunnel-argo"
-  cmd="${WORK}/argo tunnel --edge-ip-version auto --no-autoupdate --metrics 127.0.0.1:2000 --config ${ARGO_YML} run"
-  if ! service_exists "$svcname"; then
-    if is_alpine; then
-      cat > "${WORK}/argo_start.sh" <<EOF
-#!/bin/sh
-exec ${cmd}
-EOF
-      chmod +x "${WORK}/argo_start.sh"
-      cat > /etc/init.d/${svcname} <<EOF
-#!/sbin/openrc-run
-description="Cloudflare Tunnel"
-command="${WORK}/argo_start.sh"
-command_background=true
-pidfile="/var/run/${svcname}.pid"
-EOF
-      chmod +x /etc/init.d/${svcname}
-    else
-      cat > /etc/systemd/system/${svcname}.service <<EOF
-[Unit]
-Description=Cloudflare Tunnel
-After=network.target
-[Service]
-ExecStart=${cmd}
-Restart=always
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-EOF
-    fi
-    svc enable "$svcname"
+  if ! "$XRAY_BIN" run -test -c "$XRAY_CONF" >/tmp/xray_argo_check.log 2>&1; then
+    red "Xray 配置校验失败"
+    tail -n 80 /tmp/xray_argo_check.log 2>/dev/null || true
+    cf_remove_argo_inbounds
+    return 1
   fi
 
+  [ -x "${WORK}/argo" ] || { red "cloudflared 不存在: ${WORK}/argo"; return 1; }
+
+  write_argo_service
   svc restart xray
-  svc restart "$svcname"
+  svc restart tunnel-argo
+
+  cf_apply_xhttp_cache_bypass_for_domain "$domain" || yellow "Cache Rules 自动配置失败，请手动配置 XHTTP 绕过缓存"
 
   CF_MODE="argo"; save_cf_mode
   ask_enable_youtube_strict
-  green "Argo 配置完成"
+  green "Argo 配置完成（已使用 Token 自动创建 Tunnel）"
 }
 
 configure_cf_accel(){
@@ -1025,7 +1329,7 @@ configure_cf_accel(){
 uninstall_argo(){
   svc stop tunnel-argo; svc disable tunnel-argo
   rm -f /etc/init.d/tunnel-argo /etc/systemd/system/tunnel-argo.service "${WORK}/argo_start.sh" "${WORK}/argo"
-  rm -f "$ARGO_DOMAIN" "$ARGO_YML" "$ARGO_JSON"
+  rm -f "$ARGO_DOMAIN" "$ARGO_YML" "$ARGO_JSON" "$ARGO_TOKEN_FILE" "$ARGO_TUNNEL_ID_FILE"
 
   if [ -f "$XRAY_CONF" ]; then
     cf_remove_argo_inbounds
@@ -1064,7 +1368,7 @@ hy2_random_free_port(){
 }
 
 issue_cert_cf(){
-  local d="$1" token="$2" cert_dir="${3:-$TLS_DIR_HY2}"
+  local d="$1" token="${2:-}" cert_dir="${3:-$TLS_DIR_HY2}"
   local crt="${cert_dir}/${d}.crt" key="${cert_dir}/${d}.key"
   mkdir -p "$cert_dir"
   if [ -s "$crt" ] && [ -s "$key" ]; then
@@ -1074,6 +1378,7 @@ issue_cert_cf(){
       yellow "证书即将过期或已过期，开始续签: $d"
     fi
   fi
+  [ -n "$token" ] || { cf_require_token || return 1; token="$CF_API_TOKEN"; }
   ensure_acme || return 1
   export CF_Token="$token"
   yellow "申请证书: $d"
@@ -1210,7 +1515,8 @@ hy2_pick_by_index(){
 
 configure_hy2_add(){
   install_xray || return 1; ensure_dns_rule || return 1; init_hy2_list
-  local cert_mode domain token port auth obfs prof up down cert_mode_saved cert_file key_file tag
+  cf_bootstrap_once "HY2"
+  local cert_mode domain port auth obfs prof up down cert_mode_saved cert_file key_file tag
   prompt "证书模式(1=本机自签 2=CF令牌签发，默认1): " cert_mode
   [ -z "${cert_mode:-}" ] && cert_mode=1; [[ "$cert_mode" =~ ^[12]$ ]] || cert_mode=1
   if [ "$cert_mode" = "1" ]; then
@@ -1220,8 +1526,7 @@ configure_hy2_add(){
     cert_mode_saved="self"
   else
     prompt "HY2域名: " domain; [ -z "$domain" ] && { red "域名不能为空"; return 1; }
-    prompt "Cloudflare API Token: " token; [ -z "$token" ] && { red "Token不能为空"; return 1; }
-    issue_cert_cf "$domain" "$token" "$TLS_DIR_HY2" || return 1
+    issue_cert_cf "$domain" "" "$TLS_DIR_HY2" || return 1
     cert_mode_saved="cf"
   fi
   cert_file="${TLS_DIR_HY2}/${domain}.crt"; key_file="${TLS_DIR_HY2}/${domain}.key"
@@ -1412,10 +1717,11 @@ configure_hy2_reinstall_port(){
       ;;
   esac
 
-  local cert_file key_file token cert_mode_in
+  local cert_file key_file cert_mode_in
   if [ "$mode" = "2" ]; then
     auth="$(gen_uuid)"
   elif [ "$mode" = "3" ]; then
+    cf_bootstrap_once "HY2"
     prompt "证书模式(1=本机自签 2=CF令牌签发，默认1): " cert_mode_in
     [ -z "${cert_mode_in:-}" ] && cert_mode_in=1
     [[ "$cert_mode_in" =~ ^[12]$ ]] || cert_mode_in=1
@@ -1427,8 +1733,7 @@ configure_hy2_reinstall_port(){
       cert_mode="self"
     else
       prompt "HY2域名: " domain; [ -z "$domain" ] && { red "域名不能为空"; return 1; }
-      prompt "Cloudflare API Token: " token; [ -z "$token" ] && { red "Token不能为空"; return 1; }
-      issue_cert_cf "$domain" "$token" "$TLS_DIR_HY2" || return 1
+      issue_cert_cf "$domain" "" "$TLS_DIR_HY2" || return 1
       cert_mode="cf"
     fi
     prompt "HY2认证AUTH(回车随机UUID): " auth
@@ -1605,6 +1910,7 @@ configure_reality_xhttp_add(){
   install_xray || return 1
   ensure_dns_rule || return 1
   init_reality_list
+  cf_bootstrap_once "Reality"
 
   local port uuid sni target sid path kp priv pub tag ib
   prompt "XHTTP-Reality端口: " port
@@ -1669,6 +1975,7 @@ configure_reality_vision_add(){
   install_xray || return 1
   ensure_dns_rule || return 1
   init_reality_list
+  cf_bootstrap_once "Reality"
 
   local port uuid sni target sid kp priv pub tag ib
   prompt "Vision-Reality端口: " port
@@ -1814,8 +2121,37 @@ manage_reality(){
     esac
   done
 }
-
 # ========== Nodes ==========
+get_xhttp_mode_from_conf(){
+  local p="$1" mode
+  [ -f "$XRAY_CONF" ] || { echo "${XHTTP_MODE:-auto}"; return; }
+
+  mode="$(jq -r --argjson p "$p" '
+    first(.inbounds[]?
+      | select(.protocol=="vless" and .port==$p)
+      | (.streamSettings.xhttpSettings.mode // empty)
+    ) // empty
+  ' "$XRAY_CONF" 2>/dev/null || true)"
+
+  [ -n "$mode" ] || mode="${XHTTP_MODE:-auto}"
+  echo "$mode"
+}
+
+get_xhttp_extra_param_from_conf(){
+  local p="$1" extra
+  [ -f "$XRAY_CONF" ] || return 0
+
+  extra="$(jq -c --argjson p "$p" '
+    first(.inbounds[]?
+      | select(.protocol=="vless" and .port==$p)
+      | (.streamSettings.xhttpSettings.extra // empty)
+    ) // empty
+  ' "$XRAY_CONF" 2>/dev/null || true)"
+
+  [ -n "$extra" ] && [ "$extra" != "null" ] || return 0
+  printf '&extra=%s' "$(url_encode "$extra")"
+}
+
 show_xray_nodes(){
   cls
   [ "$IP_CHECKED" = "1" ] || load_ip_cache >/dev/null 2>&1 || true
@@ -1829,11 +2165,12 @@ show_xray_nodes(){
   green "=============== 节点链接 ================"
 
   if [ "$CF_MODE" = "argo" ] && [ -f "$ARGO_DOMAIN" ]; then
-    local d xextra nx nw ns
+    local d xmode xextra_param nx nw ns
     d="$(cat "$ARGO_DOMAIN")"
-    xextra="$(url_encode "$XHTTP_EXTRA_JSON")"
+    xmode="$(get_xhttp_mode_from_conf 8082)"
+    xextra_param="$(get_xhttp_extra_param_from_conf 8082)"
     nx="${BASE_FULL} - ArgoXHTTP"; nw="${BASE_FULL} - ArgoWS"; ns="${BASE_FULL} - ArgoSS"
-    purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&alpn=h2&fp=chrome&type=xhttp&host=${d}&path=%2Fxgo&mode=${XHTTP_MODE}&extra=${xextra}#$(url_encode "$nx")"; echo
+    purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&alpn=h2&fp=chrome&type=xhttp&host=${d}&path=%2Fxgo&mode=${xmode}${xextra_param}#$(url_encode "$nx")"; echo
     purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&fp=chrome&type=ws&host=${d}&path=%2Fargo%3Fed%3D2560#$(url_encode "$nw")"; echo
     cnt=$((cnt+2))
     local ssib
@@ -1850,11 +2187,12 @@ show_xray_nodes(){
   fi
 
   if [ "$CF_MODE" = "origin" ] && [ -f "$ARGO_DOMAIN" ]; then
-    local d xextra nx nw ns
+    local d xmode xextra_param nx nw ns
     d="$(cat "$ARGO_DOMAIN")"
-    xextra="$(url_encode "$XHTTP_EXTRA_JSON")"
+    xmode="$(get_xhttp_mode_from_conf "$ORIGIN_VLESS_XHTTP_PORT")"
+    xextra_param="$(get_xhttp_extra_param_from_conf "$ORIGIN_VLESS_XHTTP_PORT")"
     nx="${BASE_FULL} - CFOriginXHTTP"; nw="${BASE_FULL} - CFOriginWS"; ns="${BASE_FULL} - CFOriginSS"
-    purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&alpn=h2&fp=chrome&type=xhttp&host=${d}&path=%2Fxgo&mode=${XHTTP_MODE}&extra=${xextra}#$(url_encode "$nx")"; echo
+    purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&alpn=h2&fp=chrome&type=xhttp&host=${d}&path=%2Fxgo&mode=${xmode}${xextra_param}#$(url_encode "$nx")"; echo
     purple "vless://${uuid}@${CFIP}:443?encryption=none&security=tls&sni=${d}&fp=chrome&type=ws&host=${d}&path=%2Fargo%3Fed%3D2560#$(url_encode "$nw")"; echo
     cnt=$((cnt+2))
     local ssib
@@ -1942,6 +2280,7 @@ show_xray_nodes(){
   [ "$cnt" -eq 0 ] && yellow "暂无配置节点"
   echo "=========================================="
 }
+
 # ========== Socks5 ==========
 manage_socks5(){
   if [ ! -f "$XRAY_CONF" ]; then
@@ -2385,9 +2724,13 @@ manage_service_monitor(){
 swap_cleanup_fstab(){ [ -f /etc/fstab ] && sed -i '/^\/swapfile[[:space:]]/d' /etc/fstab; }
 swap_disable_all(){
   awk 'NR>1{print $1}' /proc/swaps 2>/dev/null | while read -r d; do [ -n "$d" ] && swapoff "$d" >/dev/null 2>&1 || true; done
-  [ -f /swapfile ] && rm -f /swapfile; swap_cleanup_fstab
+  [ -f /swapfile ] && rm -f /swapfile
+  swap_cleanup_fstab
   if [ -d /sys/class/zram-control ] || [ -e /dev/zram0 ]; then
-    for z in /sys/block/zram*; do [ -d "$z" ] || continue; echo 1 > "$z/reset" 2>/dev/null || true; done
+    for z in /sys/block/zram*; do
+      [ -d "$z" ] || continue
+      echo 1 > "$z/reset" 2>/dev/null || true
+    done
   fi
 }
 zram_supported(){
@@ -2399,9 +2742,12 @@ zram_supported(){
 }
 create_zram_swap(){
   local mb="$1" zdev=""
-  if [ -e /dev/zram0 ]; then zdev="/dev/zram0"
+  if [ -e /dev/zram0 ]; then
+    zdev="/dev/zram0"
   elif [ -w /sys/class/zram-control/hot_add ]; then
-    local id; id="$(cat /sys/class/zram-control/hot_add 2>/dev/null || true)"; [ -n "$id" ] && zdev="/dev/zram${id}"
+    local id
+    id="$(cat /sys/class/zram-control/hot_add 2>/dev/null || true)"
+    [ -n "$id" ] && zdev="/dev/zram${id}"
   fi
   [ -z "$zdev" ] && return 1
   local zn="${zdev#/dev/}"
@@ -2414,40 +2760,67 @@ create_zram_swap(){
 create_swap_dd(){
   local mb="$1"
   dd if=/dev/zero of=/swapfile bs=1M count="$mb" status=none 2>"$SWAP_LOG" || return 1
-  chmod 600 /swapfile || return 1; mkswap /swapfile >/dev/null 2>&1 || return 1; swapon /swapfile >/dev/null 2>&1 || return 1
+  chmod 600 /swapfile || return 1
+  mkswap /swapfile >/dev/null 2>&1 || return 1
+  swapon /swapfile >/dev/null 2>&1 || return 1
   grep -q "^/swapfile[[:space:]]" /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
 }
 create_swap_fallocate(){
   local mb="$1"
   command -v fallocate >/dev/null 2>&1 || return 1
   fallocate -l "${mb}M" /swapfile 2>"$SWAP_LOG" || return 1
-  chmod 600 /swapfile || return 1; mkswap -f /swapfile >/dev/null 2>&1 || return 1; swapon /swapfile >/dev/null 2>&1 || return 1
+  chmod 600 /swapfile || return 1
+  mkswap -f /swapfile >/dev/null 2>&1 || return 1
+  swapon /swapfile >/dev/null 2>&1 || return 1
   grep -q "^/swapfile[[:space:]]" /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
 }
 create_swap_best(){
   local mb="${1:-128}"
   swap_disable_all
-  if zram_supported && create_zram_swap "$mb"; then green "SWAP成功(ZRAM ${mb}MB)"; return 0; fi
-  if create_swap_dd "$mb"; then green "SWAP成功(dd ${mb}MB)"; return 0; fi
+  if zram_supported && create_zram_swap "$mb"; then
+    green "SWAP成功(ZRAM ${mb}MB)"
+    return 0
+  fi
+  if create_swap_dd "$mb"; then
+    green "SWAP成功(dd ${mb}MB)"
+    return 0
+  fi
   rm -f /swapfile
-  if create_swap_fallocate "$mb"; then green "SWAP成功(fallocate ${mb}MB)"; return 0; fi
-  red "SWAP失败"; return 1
+  if create_swap_fallocate "$mb"; then
+    green "SWAP成功(fallocate ${mb}MB)"
+    return 0
+  fi
+  red "SWAP失败"
+  return 1
 }
 manage_swap(){
   while true; do
     cls
     local ram sw
-    ram=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null); [ -z "$ram" ] && ram=0
-    sw=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null); [ -z "$sw" ] && sw=0
+    ram=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    [ -z "$ram" ] && ram=0
+    sw=$(awk '/SwapTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    [ -z "$sw" ] && sw=0
     echo -e "${C_WARN}=============== SWAP管理 ===============${C_RST}"
     echo "RAM: ${ram}MB  SWAP: ${sw}MB"
     echo "-----------------------------------------------"
-    menu_item_auto "1" "安装SWAP"; menu_item_auto "2" "卸载SWAP"; menu_item_auto "0" "返回"
+    menu_item_auto "1" "安装SWAP"
+    menu_item_auto "2" "卸载SWAP"
+    menu_item_auto "0" "返回"
     echo "==============================================="
     prompt "请选择: " c
     case "$c" in
-      1) prompt "大小MB(默认128): " mb; mb=${mb:-128}; [[ "$mb" =~ ^[0-9]+$ ]] && [ "$mb" -gt 0 ] && create_swap_best "$mb" || red "输入无效"; pause ;;
-      2) swap_disable_all; green "已清理"; pause ;;
+      1)
+        prompt "大小MB(默认128): " mb
+        mb=${mb:-128}
+        [[ "$mb" =~ ^[0-9]+$ ]] && [ "$mb" -gt 0 ] && create_swap_best "$mb" || red "输入无效"
+        pause
+        ;;
+      2)
+        swap_disable_all
+        green "已清理"
+        pause
+        ;;
       0) return ;;
       *) red "无效"; pause ;;
     esac
@@ -2481,22 +2854,30 @@ EOF
   chmod 755 "$dst"
   chown root:root "$dst" 2>/dev/null || true
 
-  touch "$mark"; chmod 600 "$mark" 2>/dev/null || true
+  touch "$mark"
+  chmod 600 "$mark" 2>/dev/null || true
   green "快捷方式已创建：xray -> /etc/xray/manager.sh"
 }
 
 full_uninstall(){
-  svc stop tunnel-argo; svc disable tunnel-argo
-  svc stop xray; svc disable xray
+  svc stop tunnel-argo
+  svc disable tunnel-argo
+  svc stop xray
+  svc disable xray
   stop_service_monitor || true
+
   pkill -f '/etc/xray/argo tunnel' >/dev/null 2>&1 || true
+  pkill -f '/etc/xray/argo_start.sh' >/dev/null 2>&1 || true
   pkill -x xray >/dev/null 2>&1 || true
+
   rm -f /etc/init.d/tunnel-argo /etc/systemd/system/tunnel-argo.service
   rm -f /etc/init.d/xray /etc/systemd/system/xray.service
+
   command -v systemctl >/dev/null 2>&1 && {
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed >/dev/null 2>&1 || true
   }
+
   local clr_swap
   prompt "是否同时清理SWAP? (y/N): " clr_swap
   case "${clr_swap:-N}" in
@@ -2508,9 +2889,10 @@ full_uninstall(){
       yellow "已跳过 SWAP 清理"
       ;;
   esac
+
   rm -f /usr/local/bin/xray
   rm -rf "$WORK"
-  green "已彻底卸载（服务/配置/快捷方式/监控）"
+  green "已彻底卸载（服务/配置/快捷方式/监控/Cloudflare Token缓存）"
 }
 
 # ========== Outbound menu ==========
@@ -2526,7 +2908,9 @@ manage_outbound_menu(){
     echo -e "IPv6 出站(严格): \033[1;36m${v6_disp}\033[0m"
     echo -e "YouTube V6 出站: \033[1;36m$( [ "$YOUTUBE_MODE" = "2" ] && echo '开启(严格)' || echo '关闭' )\033[0m"
     echo "-----------------------------------------------"
-    menu_item_auto "1" "设置 YouTube V6 出站"; menu_item_auto "2" "管理 IPv6 出站列表"; menu_item_auto "0" "返回"
+    menu_item_auto "1" "设置 YouTube V6 出站"
+    menu_item_auto "2" "管理 IPv6 出站列表"
+    menu_item_auto "0" "返回"
     echo "==============================================="
     prompt "请选择: " c
     case "$c" in
@@ -2537,7 +2921,10 @@ manage_outbound_menu(){
           2) YOUTUBE_MODE=2; green "已开启 YouTube V6 出站(严格)" ;;
           *) red "输入无效" ;;
         esac
-        save_outbound; apply_policy_all; pause ;;
+        save_outbound
+        apply_policy_all
+        pause
+        ;;
       2)
         while true; do
           cls
@@ -2548,7 +2935,9 @@ manage_outbound_menu(){
           echo -e "${C_WARN}===== IPv6 出站列表（严格） =====${C_RST}"
           echo -e "当前列表: \033[1;36m${list_disp}\033[0m"
           echo "-----------------------------------------------"
-          menu_item_auto "1" "添加域名"; menu_item_auto "2" "删除域名"; menu_item_auto "0" "返回"
+          menu_item_auto "1" "添加域名"
+          menu_item_auto "2" "删除域名"
+          menu_item_auto "0" "返回"
           echo "==============================================="
           prompt "请选择: " d
           case "$d" in
@@ -2561,16 +2950,28 @@ manage_outbound_menu(){
                 V6_SITES="${V6_SITES},${s}"
               fi
               V6_SITES="$(echo "$V6_SITES" | sed 's/,,/,/g; s/^,//; s/,$//')"
-              save_outbound; apply_policy_all; green "已添加并应用"; pause ;;
+              save_outbound
+              apply_policy_all
+              green "已添加并应用"
+              pause
+              ;;
             2)
-              if [ "$(echo "$list_json" | jq 'length')" -eq 0 ]; then red "列表为空"; pause; continue; fi
+              if [ "$(echo "$list_json" | jq 'length')" -eq 0 ]; then
+                red "列表为空"
+                pause
+                continue
+              fi
               echo "当前 IPv6 出站域名："
               echo "$list_json" | jq -r '.[]' | nl -w2 -s'. '
               echo "输入序号（支持 1,3,5 ）或 a 全删，0取消"
               prompt "输入: " list
               if [[ "$list" =~ ^[aA]$ ]]; then
                 V6_SITES=""
-                save_outbound; apply_policy_all; green "已全删并应用"; pause; continue
+                save_outbound
+                apply_policy_all
+                green "已全删并应用"
+                pause
+                continue
               fi
               [ "$list" = "0" ] && continue
               local IFS=',' one target delset=""
@@ -2584,11 +2985,16 @@ manage_outbound_menu(){
               local new_json
               new_json="$(echo "$list_json" | jq -r --argjson delset "$(echo "$delset" | jq -Rsc 'split("\n") | map(select(length>0))')" '. - $delset')"
               V6_SITES="$(echo "$new_json" | jq -r 'join(",")')"
-              save_outbound; apply_policy_all; green "已删除并应用"; pause ;;
+              save_outbound
+              apply_policy_all
+              green "已删除并应用"
+              pause
+              ;;
             0) break ;;
             *) red "无效"; pause ;;
           esac
-        done ;;
+        done
+        ;;
       0) return ;;
       *) red "无效"; pause ;;
     esac
@@ -2601,25 +3007,46 @@ xray_menu(){
     cls
     load_cf_mode
     local xs as hs rs cm
-    if [ -x "$XRAY_BIN" ]; then xs=$(is_running xray && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else xs="${C_BAD}未安装${C_RST}"; fi
-    if service_exists tunnel-argo; then as=$(is_running tunnel-argo && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}"); else as="${C_BAD}未配置${C_RST}"; fi
+    if [ -x "$XRAY_BIN" ]; then
+      xs=$(is_running xray && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}")
+    else
+      xs="${C_BAD}未安装${C_RST}"
+    fi
+    if service_exists tunnel-argo; then
+      as=$(is_running tunnel-argo && echo "\033[1;36m运行中\033[0m" || echo "${C_BAD}未启动${C_RST}")
+    else
+      as="${C_BAD}未配置${C_RST}"
+    fi
     init_hy2_list
-    if [ "$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then hs="\033[1;36m已配置\033[0m"; else hs="${C_BAD}未配置${C_RST}"; fi
+    if [ "$(jq 'length' "$HY2_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then
+      hs="\033[1;36m已配置\033[0m"
+    else
+      hs="${C_BAD}未配置${C_RST}"
+    fi
     init_reality_list
-    if [ "$(jq 'length' "$REALITY_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then rs="\033[1;36m已配置\033[0m"; else rs="${C_BAD}未配置${C_RST}"; fi
+    if [ "$(jq 'length' "$REALITY_LIST" 2>/dev/null || echo 0)" -gt 0 ]; then
+      rs="\033[1;36m已配置\033[0m"
+    else
+      rs="${C_BAD}未配置${C_RST}"
+    fi
     cm="$(cf_mode_display)"
 
     echo -e "${C_OK}=============== Xray管理 ===============${C_RST}"
     echo -e "Xray: ${xs}   Argo: ${as}   HY2: ${hs}   Reality: ${rs}"
     echo -e "CF加速模式: \033[1;36m${cm}\033[0m"
+    if [ -n "${CF_API_TOKEN:-}" ] || load_cf_api >/dev/null 2>&1; then
+      echo -e "CF自动配置: \033[1;36m已保存Token\033[0m"
+    else
+      echo -e "CF自动配置: ${C_BAD}未配置Token${C_RST}"
+    fi
     echo "-----------------------------------------------"
     menu_row2_auto "1"  "配置CF加速"         "8"  "实时日志"
     menu_row2_auto "2"  "配置Reality"        "9"  "查看节点"
     menu_row2_auto "3"  "配置HY2"            "10" "修改UUID"
     menu_row2_auto "4"  "配置Socks5"         "11" "卸载Xray"
     menu_row2_auto "5"  "重启Argo"           "12" "更新Xray"
-    menu_row2_auto "6"  "重启Xray"           "0"  "返回"
-    menu_row2_auto "7"  "卸载Argo"
+    menu_row2_auto "6"  "重启Xray"           "13" "设置CF令牌"
+    menu_row2_auto "7"  "卸载Argo"           "0"  "返回"
     echo "==============================================="
     prompt "请选择: " c
     case "$c" in
@@ -2627,14 +3054,43 @@ xray_menu(){
       2) manage_reality ;;
       3) manage_hy2 ;;
       4) manage_socks5 ;;
-      5) service_exists tunnel-argo && svc restart tunnel-argo && green "Argo 已重启" || red "Argo未安装"; pause ;;
-      6) service_exists xray && svc restart xray && green "Xray 已重启" || red "Xray未安装"; pause ;;
-      7) uninstall_argo; pause ;;
+      5)
+        service_exists tunnel-argo && svc restart tunnel-argo && green "Argo 已重启" || red "Argo未安装"
+        pause
+        ;;
+      6)
+        service_exists xray && svc restart xray && green "Xray 已重启" || red "Xray未安装"
+        pause
+        ;;
+      7)
+        uninstall_argo
+        pause
+        ;;
       8) foreground_xray_log ;;
-      9) show_xray_nodes; pause ;;
-      10) prompt "新UUID(回车自动): " u; [ -z "$u" ] && u="$(gen_uuid)"; set_xray_uuid "$u"; pause ;;
-      11) uninstall_xray_only; pause ;;
-      12) update_xray_core; pause ;;
+      9)
+        show_xray_nodes
+        pause
+        ;;
+      10)
+        prompt "新UUID(回车自动): " u
+        [ -z "$u" ] && u="$(gen_uuid)"
+        set_xray_uuid "$u"
+        pause
+        ;;
+      11)
+        uninstall_xray_only
+        pause
+        ;;
+      12)
+        update_xray_core
+        pause
+        ;;
+      13)
+        rm -f "$CF_API_BOOTSTRAP_DONE" 2>/dev/null || true
+        CF_API_TOKEN=""
+        cf_require_token
+        pause
+        ;;
       0) return ;;
       *) red "无效"; pause ;;
     esac
@@ -2645,7 +3101,6 @@ xray_menu(){
 detect_virt_name(){
   local v=""
 
-  # 1) systemd-detect-virt（最优先）
   if command -v systemd-detect-virt >/dev/null 2>&1; then
     v="$(systemd-detect-virt 2>/dev/null || true)"
     case "${v,,}" in
@@ -2660,7 +3115,6 @@ detect_virt_name(){
     esac
   fi
 
-  # 2) systemd 标记文件
   if [ -r /run/systemd/container ]; then
     v="$(cat /run/systemd/container 2>/dev/null || true)"
     case "${v,,}" in
@@ -2673,13 +3127,11 @@ detect_virt_name(){
     esac
   fi
 
-  # 3) /proc/1/environ
   if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=podman$'; then echo "PODMAN"; return; fi
   if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=docker$'; then echo "DOCKER"; return; fi
   if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=lxc$'; then echo "LXC"; return; fi
   if tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -qi '^container=containerd$'; then echo "CONTAINERD"; return; fi
 
-  # 4) cgroup（兼容 v1/v2）
   if grep -qaE '(podman|docker|containerd|kubepods|lxc)' /proc/1/cgroup 2>/dev/null; then
     if grep -qa 'podman' /proc/1/cgroup 2>/dev/null; then echo "PODMAN"; return; fi
     if grep -qa 'docker' /proc/1/cgroup 2>/dev/null; then echo "DOCKER"; return; fi
@@ -2688,32 +3140,47 @@ detect_virt_name(){
     echo "CONTAINER"; return
   fi
 
-  # 5) Podman 常见文件痕迹（补强）
   [ -f /run/.containerenv ] && { echo "PODMAN"; return; }
   [ -f /.dockerenv ] && { echo "DOCKER"; return; }
 
-  # 6) 其他容器泛化
   if grep -qaE '(container|podman|docker)' /proc/1/mountinfo 2>/dev/null; then
-    echo "CONTAINER"; return
+    echo "CONTAINER"
+    return
   fi
 
   echo "UNKNOWN"
 }
 arch_disp(){
   case "$(uname -m)" in
-    x86_64|amd64) echo "x64" ;; i?86) echo "x86" ;; aarch64|arm64) echo "arm64" ;; armv7l|armv7|armhf) echo "armv7" ;; armv6l|armv6) echo "armv6" ;; s390x) echo "s390x" ;; riscv64) echo "riscv64" ;; *) uname -m ;;
+    x86_64|amd64) echo "x64" ;;
+    i?86) echo "x86" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7|armhf) echo "armv7" ;;
+    armv6l|armv6) echo "armv6" ;;
+    s390x) echo "s390x" ;;
+    riscv64) echo "riscv64" ;;
+    *) uname -m ;;
   esac
 }
 os_version_disp(){
   local osv
-  if is_alpine; then osv="Alpine $(cat /etc/alpine-release 2>/dev/null || echo "")"
+  if is_alpine; then
+    osv="Alpine $(cat /etc/alpine-release 2>/dev/null || echo "")"
   elif [ -f /etc/os-release ]; then
     . /etc/os-release
-    if [ -n "${ID:-}" ] && [ -n "${VERSION_ID:-}" ]; then osv="$(echo "$ID" | sed 's/^[a-z]/\U&/') ${VERSION_ID}"; else osv="${PRETTY_NAME:-Linux}"; fi
-  else osv="Linux"; fi
+    if [ -n "${ID:-}" ] && [ -n "${VERSION_ID:-}" ]; then
+      osv="$(echo "$ID" | sed 's/^[a-z]/\U&/') ${VERSION_ID}"
+    else
+      osv="${PRETTY_NAME:-Linux}"
+    fi
+  else
+    osv="Linux"
+  fi
   echo "$osv"
 }
-kernel_disp(){ cut -d- -f1 < /proc/sys/kernel/osrelease 2>/dev/null || uname -r; }
+kernel_disp(){
+  cut -d- -f1 < /proc/sys/kernel/osrelease 2>/dev/null || uname -r
+}
 cpu_model_disp(){
   local model
   model="$(awk -F: '
@@ -2721,28 +3188,46 @@ cpu_model_disp(){
     /Hardware/   {gsub(/^[ \t]+/, "", $2); print $2; exit}
     /Processor/  {gsub(/^[ \t]+/, "", $2); print $2; exit}
   ' /proc/cpuinfo 2>/dev/null)"
-  [ -z "$model" ] && model="$(uname -m)"; echo "$model"
+  [ -z "$model" ] && model="$(uname -m)"
+  echo "$model"
 }
-cpu_cores_disp(){ nproc 2>/dev/null || awk '/^processor/{n++} END{print (n?n:1)}' /proc/cpuinfo 2>/dev/null; }
+cpu_cores_disp(){
+  nproc 2>/dev/null || awk '/^processor/{n++} END{print (n?n:1)}' /proc/cpuinfo 2>/dev/null
+}
 cpu_usage_percent(){
   local user nice system idle iowait irq softirq steal guest guest_nice
   local total idle_all diff_total diff_idle usage
   local s1_total s1_idle s2_total s2_idle
   read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
-  total=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle_all=$((idle+iowait))
+  total=$((user+nice+system+idle+iowait+irq+softirq+steal))
+  idle_all=$((idle+iowait))
   if [ "${CPU_LAST_TOTAL:-0}" -eq 0 ] || [ "${CPU_LAST_IDLE:-0}" -eq 0 ]; then
-    s1_total="$total"; s1_idle="$idle_all"; sleep 0.2
+    s1_total="$total"
+    s1_idle="$idle_all"
+    sleep 0.2
     read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
-    s2_total=$((user+nice+system+idle+iowait+irq+softirq+steal)); s2_idle=$((idle+iowait))
-    diff_total=$((s2_total-s1_total)); diff_idle=$((s2_idle-s1_idle))
-    CPU_LAST_TOTAL="$s2_total"; CPU_LAST_IDLE="$s2_idle"
+    s2_total=$((user+nice+system+idle+iowait+irq+softirq+steal))
+    s2_idle=$((idle+iowait))
+    diff_total=$((s2_total-s1_total))
+    diff_idle=$((s2_idle-s1_idle))
+    CPU_LAST_TOTAL="$s2_total"
+    CPU_LAST_IDLE="$s2_idle"
     if [ "$diff_total" -le 0 ]; then echo "0"; return; fi
-    usage=$(( (100*(diff_total-diff_idle))/diff_total )); [ "$usage" -lt 0 ] && usage=0; [ "$usage" -gt 100 ] && usage=100; echo "$usage"; return
+    usage=$(( (100*(diff_total-diff_idle))/diff_total ))
+    [ "$usage" -lt 0 ] && usage=0
+    [ "$usage" -gt 100 ] && usage=100
+    echo "$usage"
+    return
   fi
-  diff_total=$((total-CPU_LAST_TOTAL)); diff_idle=$((idle_all-CPU_LAST_IDLE))
-  CPU_LAST_TOTAL="$total"; CPU_LAST_IDLE="$idle_all"
+  diff_total=$((total-CPU_LAST_TOTAL))
+  diff_idle=$((idle_all-CPU_LAST_IDLE))
+  CPU_LAST_TOTAL="$total"
+  CPU_LAST_IDLE="$idle_all"
   if [ "$diff_total" -le 0 ]; then echo "0"; return; fi
-  usage=$(( (100*(diff_total-diff_idle))/diff_total )); [ "$usage" -lt 0 ] && usage=0; [ "$usage" -gt 100 ] && usage=100; echo "$usage"
+  usage=$(( (100*(diff_total-diff_idle))/diff_total ))
+  [ "$usage" -lt 0 ] && usage=0
+  [ "$usage" -gt 100 ] && usage=100
+  echo "$usage"
 }
 mem_swap_used_disp(){
   awk '
@@ -2776,9 +3261,11 @@ main_menu(){
 
   load_ip_cache >/dev/null 2>&1 || true
   [ "$IP_CHECKED" = "1" ] || {
-    cls; echo -e "\033[1;33mIP信息加载中，请稍候...\033[0m"
+    cls
+    echo -e "\033[1;33mIP信息加载中，请稍候...\033[0m"
     check_ip || { red "IP检测失败，已跳过（不影响进入菜单）"; sleep 1; }
   }
+
   while true; do
     cls
     [ -f "$IPCACHE" ] && {
@@ -2786,11 +3273,20 @@ main_menu(){
       mt=$(stat -c %Y "$IPCACHE" 2>/dev/null || echo 0)
       [ "$mt" -gt "${IP_CACHE_MTIME:-0}" ] && IP_CACHE_MTIME="$mt" && load_ip_cache >/dev/null 2>&1 || true
     }
+
     local osver arch ker virt cpu_model cpu_cores cpu_use ms u4 u6
     local mem swap
-    osver="$(os_version_disp)"; arch="$(arch_disp)"; ker="$(kernel_disp)"; virt="$(detect_virt_name)"
-    cpu_model="$(cpu_model_disp)"; cpu_cores="$(cpu_cores_disp)"; cpu_use="$(cpu_usage_percent)"
-    ms="$(mem_swap_used_disp)"; mem="${ms%%|*}"; swap="${ms#*|}"
+    osver="$(os_version_disp)"
+    arch="$(arch_disp)"
+    ker="$(kernel_disp)"
+    virt="$(detect_virt_name)"
+    cpu_model="$(cpu_model_disp)"
+    cpu_cores="$(cpu_cores_disp)"
+    cpu_use="$(cpu_usage_percent)"
+    ms="$(mem_swap_used_disp)"
+    mem="${ms%%|*}"
+    swap="${ms#*|}"
+
     if [ -n "${WAN4:-}" ]; then
       u4="${EMOJI4} ${COUNTRY4} ${WAN4}"
       [ -n "${ISP4:-}" ] && [ "${ISP4}" != "unknown" ] && u4="${u4} | ${ISP4}"
@@ -2798,6 +3294,7 @@ main_menu(){
     else
       u4="${C_BAD}未检测到${C_RST}"
     fi
+
     if [ -n "${WAN6:-}" ]; then
       u6="${EMOJI6} ${COUNTRY6} ${WAN6}"
       [ -n "${ISP6:-}" ] && [ "${ISP6}" != "unknown" ] && u6="${u6} | ${ISP6}"
@@ -2805,6 +3302,7 @@ main_menu(){
     else
       u6="${C_BAD}未检测到${C_RST}"
     fi
+
     echo -e "${C_DIM}================ 系统信息 ================${C_RST}"
     echo -e "OS   : \033[1;36m${osver} | ${arch} | ${ker} | ${virt}\033[0m"
     echo -e "CPU  : \033[1;36m${cpu_model} | ${cpu_cores}C | ${cpu_use}%\033[0m"
@@ -2815,6 +3313,7 @@ main_menu(){
     echo -e "IPv6 : ${u6}"
     echo -e "${C_DIM}==========================================${C_RST}"
     echo
+
     menu_row2_auto "1" "管理Xray"   "6" "管理SWAP"
     menu_row2_auto "2" "管理出站"   "8" "创建快捷"
     menu_row2_auto "3" "服务监控"   "9" "彻底卸载"
@@ -2833,5 +3332,6 @@ main_menu(){
     esac
   done
 }
+
 trap 'echo; cls; red "已中断"; exit 130' INT TERM
 main_menu
