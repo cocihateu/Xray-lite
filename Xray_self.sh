@@ -328,7 +328,7 @@ EOF
 # ========== Cloudflare API ==========
 cf_api_call(){
   local method="$1" endpoint="$2" data="$3"
-  local url="https://api.cloudflare.com/v4${endpoint}"
+  local url="https://api.cloudflare.com/client/v4${endpoint}"
   [ -z "${CF_API_TOKEN:-}" ] && { red "CF_API_TOKEN 未设置"; return 1; }
   local resp
   if [ -n "$data" ]; then
