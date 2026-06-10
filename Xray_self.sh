@@ -113,7 +113,7 @@ CF_API_TOKEN=""; CF_API_ACCOUNT_ID=""
 
 # ========== Service ==========
 is_alpine(){ [ -f /etc/alpine-release ]; }
-service_exists(){ local s="$1"; if is_alpine; then [ -f "/etc/init.d/${s}" ]; else [ -f "/etc/systemd/system/${s}.service" ] || systemctl list-unit-files 2>/dev/null | grep -q "^${s}\.service"; fi; }
+service_exists(){ local s="$1"; if is_alpine; then [ -f "/etc/init.d/${s}" ]; else [ -f "/etc/systemd/system/${s}.service" ] || systemctl list-unit-files --type=service --all 2>/dev/null | grep -q "^${s}\.service"; fi; }
 svc(){ local act="$1" s="$2"; if is_alpine; then case "$act" in start|stop|restart) rc-service "$s" "$act" >/dev/null 2>&1 || true ;; enable) rc-update add "$s" default >/dev/null 2>&1 || true ;; disable) rc-update del "$s" default >/dev/null 2>&1 || true ;; esac; else case "$act" in enable) systemctl enable "$s" >/dev/null 2>&1 || true; systemctl daemon-reload >/dev/null 2>&1 || true ;; disable) systemctl disable "$s" >/dev/null 2>&1 || true; systemctl daemon-reload >/dev/null 2>&1 || true ;; *) systemctl "$act" "$s" >/dev/null 2>&1 || true ;; esac; fi; }
 is_running(){ if is_alpine; then rc-service "$1" status 2>/dev/null | grep -q started; else [ "$(systemctl is-active "$1" 2>/dev/null)" = "active" ]; fi; }
 
