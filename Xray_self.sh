@@ -108,7 +108,7 @@ SCRIPT_URL_DEFAULT="https://raw.githubusercontent.com/cocihateu/Xray-lite/refs/h
 SCRIPT_URL="${SCRIPT_URL:-$SCRIPT_URL_DEFAULT}"
 YOUTUBE_MODE=1
 V6_SITES=""
-IP_CHECKED=0; IP_CACHE_MTIME=0; IP_CACHE_EXPIRE=300; IP_LAST_CHECK=0; WAN4=""; WAN6=""; COUNTRY4=""; COUNTRY6=""; ISP4=""; ISP6=""; EMOJI4=""; EMOJI6=""; BASE_REGION="Node"; BASE_FULL="Node"
+IP_CHECKED=0; IP_CACHE_MTIME=0; WAN4=""; WAN6=""; COUNTRY4=""; COUNTRY6=""; ISP4=""; ISP6=""; EMOJI4=""; EMOJI6=""; BASE_REGION="Node"; BASE_FULL="Node"
 CF_API_TOKEN=""; CF_API_ACCOUNT_ID=""
 
 # ========== Service ==========
@@ -629,7 +629,6 @@ EMOJI4=$(printf '%q' "$EMOJI4")
 EMOJI6=$(printf '%q' "$EMOJI6")
 BASE_REGION=$(printf '%q' "$BASE_REGION")
 BASE_FULL=$(printf '%q' "$BASE_FULL")
-IP_LAST_CHECK=$(date +%s)
 EOF
 }
 load_ip_cache(){ 
@@ -693,23 +692,11 @@ check_ip(){
   fi
   apply_base_name || true
   IP_CHECKED=1
-  IP_LAST_CHECK=$(date +%s)
   save_ip_cache || true
 }
 check_ip_with_cache(){
-  local now cache_age
-  now=$(date +%s)
-  
-  if [ "${IP_CHECKED:-0}" = "1" ]; then
-    cache_age=$((now - IP_LAST_CHECK))
-    [ "$cache_age" -lt "${IP_CACHE_EXPIRE:-300}" ] && return 0
-  fi
-  
-  if load_ip_cache 2>/dev/null; then
-    cache_age=$((now - IP_LAST_CHECK))
-    [ "$cache_age" -lt "${IP_CACHE_EXPIRE:-300}" ] && return 0
-  fi
-  
+  [ "${IP_CHECKED:-0}" = "1" ] && return 0
+  load_ip_cache 2>/dev/null && return 0
   check_ip
 }
 pick_node_host(){ if [ -n "${WAN6:-}" ]; then echo "[${WAN6}]"; elif [ -n "${WAN4:-}" ]; then echo "${WAN4}"; else echo ""; fi; }
